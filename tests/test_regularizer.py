@@ -2,6 +2,7 @@ import copy
 import warnings
 from contextlib import nullcontext as does_not_raise
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -12,6 +13,9 @@ from sklearn.linear_model import GammaRegressor, PoissonRegressor
 from statsmodels.tools.sm_exceptions import DomainWarning
 
 import nemos as nmo
+
+# Register every test here as solver-related
+pytestmark = pytest.mark.solver_related
 
 
 @pytest.mark.parametrize(
@@ -358,12 +362,12 @@ class TestUnRegularized:
         raise_exception = not callable(loss)
         regularizer = self.cls()
         model = nmo.glm.GLM(regularizer=regularizer)
-        model._predict_and_compute_loss = loss
+        model.compute_loss = loss
         if raise_exception:
             with pytest.raises(TypeError, match="The `loss` must be a Callable"):
-                nmo.utils.assert_is_callable(model._predict_and_compute_loss, "loss")
+                nmo.utils.assert_is_callable(model.compute_loss, "loss")
         else:
-            nmo.utils.assert_is_callable(model._predict_and_compute_loss, "loss")
+            nmo.utils.assert_is_callable(model.compute_loss, "loss")
 
     @pytest.mark.parametrize(
         "solver_name",
@@ -377,7 +381,7 @@ class TestUnRegularized:
         # set regularizer and solver name
         model.set_params(regularizer=self.cls())
         model.solver_name = solver_name
-        model.instantiate_solver()
+        model.instantiate_solver(model.compute_loss)
         model.solver_run((true_params[0] * 0.0, true_params[1]), X, y)
 
     @pytest.mark.parametrize(
@@ -392,7 +396,7 @@ class TestUnRegularized:
         # set regularizer and solver name
         model.set_params(regularizer=self.cls())
         model.solver_name = solver_name
-        model.instantiate_solver()
+        model.instantiate_solver(model.compute_loss)
         model.solver_run(
             (jax.tree_util.tree_map(jnp.zeros_like, true_params[0]), true_params[1]),
             X.data,
@@ -410,12 +414,12 @@ class TestUnRegularized:
         model.set_params(regularizer=self.cls())
         model.solver_name = solver_name
         model.solver_kwargs = {"tol": 10**-12}
-        model.instantiate_solver()
+        model.instantiate_solver(model.compute_loss)
 
         # update solver name
         model_bfgs = copy.deepcopy(model)
         model_bfgs.solver_name = "BFGS"
-        model_bfgs.instantiate_solver()
+        model_bfgs.instantiate_solver(model_bfgs.compute_loss)
         weights_gd, intercepts_gd = model.solver_run(
             (true_params[0] * 0.0, true_params[1]), X, y
         )[0]
@@ -441,7 +445,7 @@ class TestUnRegularized:
         model.set_params(regularizer=self.cls())
         model.solver_name = solver_name
         model.solver_kwargs = {"tol": 10**-12}
-        model.instantiate_solver()
+        model.instantiate_solver(model.compute_loss)
         weights_bfgs, intercepts_bfgs = model.solver_run(
             (true_params[0] * 0.0, true_params[1]), X, y
         )[0]
@@ -466,7 +470,7 @@ class TestUnRegularized:
         model.set_params(regularizer=self.cls())
         model.solver_name = solver_name
         model.solver_kwargs = {"tol": 10**-12}
-        model.instantiate_solver()
+        model.instantiate_solver(model.compute_loss)
         weights_bfgs, intercepts_bfgs = model.solver_run(
             (true_params[0] * 0.0, true_params[1]), X, y
         )[0]
@@ -499,7 +503,7 @@ class TestUnRegularized:
         model.set_params(regularizer=self.cls())
         model.solver_name = solver_name
         model.solver_kwargs = {"tol": 10**-13}
-        model.instantiate_solver()
+        model.instantiate_solver(model.compute_loss)
         weights_bfgs, intercepts_bfgs = model.solver_run(
             model._initialize_parameters(X, y), X, y
         )[0]
@@ -544,7 +548,7 @@ class TestUnRegularized:
         model.set_params(regularizer=self.cls())
         model.solver_name = solver_name
         model.solver_kwargs = {"tol": 10**-13}
-        model.instantiate_solver()
+        model.instantiate_solver(model.compute_loss)
         weights_bfgs, intercepts_bfgs = model.solver_run(
             model._initialize_parameters(X, y), X, y
         )[0]
@@ -716,12 +720,12 @@ class TestRidge:
         raise_exception = not callable(loss)
         regularizer = self.cls()
         model = nmo.glm.GLM(regularizer=regularizer, regularizer_strength=1.0)
-        model._predict_and_compute_loss = loss
+        model.compute_loss = loss
         if raise_exception:
             with pytest.raises(TypeError, match="The `loss` must be a Callable"):
-                nmo.utils.assert_is_callable(model._predict_and_compute_loss, "loss")
+                nmo.utils.assert_is_callable(model.compute_loss, "loss")
         else:
-            nmo.utils.assert_is_callable(model._predict_and_compute_loss, "loss")
+            nmo.utils.assert_is_callable(model.compute_loss, "loss")
 
     @pytest.mark.parametrize(
         "solver_name",
@@ -735,7 +739,7 @@ class TestRidge:
         # set regularizer and solver name
         model.set_params(regularizer=self.cls(), regularizer_strength=1.0)
         model.solver_name = solver_name
-        runner = model.instantiate_solver().solver_run
+        runner = model.instantiate_solver(model.compute_loss).solver_run
         runner((true_params[0] * 0.0, true_params[1]), X, y)
 
     @pytest.mark.parametrize(
@@ -750,7 +754,7 @@ class TestRidge:
         # set regularizer and solver name
         model.set_params(regularizer=self.cls(), regularizer_strength=1.0)
         model.solver_name = solver_name
-        runner = model.instantiate_solver().solver_run
+        runner = model.instantiate_solver(model.compute_loss).solver_run
         runner(
             (jax.tree_util.tree_map(jnp.zeros_like, true_params[0]), true_params[1]),
             X.data,
@@ -773,8 +777,8 @@ class TestRidge:
         model_bfgs = copy.deepcopy(model)
         model_bfgs.solver_name = "BFGS"
 
-        runner_gd = model.instantiate_solver().solver_run
-        runner_bfgs = model_bfgs.instantiate_solver().solver_run
+        runner_gd = model.instantiate_solver(model.compute_loss).solver_run
+        runner_bfgs = model_bfgs.instantiate_solver(model_bfgs.compute_loss).solver_run
 
         weights_gd, intercepts_gd = runner_gd(
             (true_params[0] * 0.0, true_params[1]), X, y
@@ -801,7 +805,7 @@ class TestRidge:
         model.solver_kwargs = {"tol": 10**-12}
         model.solver_name = "BFGS"
 
-        runner_bfgs = model.instantiate_solver().solver_run
+        runner_bfgs = model.instantiate_solver(model.compute_loss).solver_run
         weights_bfgs, intercepts_bfgs = runner_bfgs(
             (true_params[0] * 0.0, true_params[1]), X, y
         )[0]
@@ -828,7 +832,7 @@ class TestRidge:
         model.solver_kwargs = {"tol": 10**-12}
         model.regularizer_strength = 0.1
         model.solver_name = "BFGS"
-        runner_bfgs = model.instantiate_solver().solver_run
+        runner_bfgs = model.instantiate_solver(model.compute_loss).solver_run
         weights_bfgs, intercepts_bfgs = runner_bfgs(
             (true_params[0] * 0.0, true_params[1]), X, y
         )[0]
@@ -979,12 +983,12 @@ class TestLasso:
         raise_exception = not callable(loss)
         regularizer = self.cls()
         model = nmo.glm.GLM(regularizer=regularizer, regularizer_strength=1)
-        model._predict_and_compute_loss = loss
+        model.compute_loss = loss
         if raise_exception:
             with pytest.raises(TypeError, match="The `loss` must be a Callable"):
-                nmo.utils.assert_is_callable(model._predict_and_compute_loss, "loss")
+                nmo.utils.assert_is_callable(model.compute_loss, "loss")
         else:
-            nmo.utils.assert_is_callable(model._predict_and_compute_loss, "loss")
+            nmo.utils.assert_is_callable(model.compute_loss, "loss")
 
     @pytest.mark.parametrize("solver_name", ["ProximalGradient", "ProxSVRG"])
     def test_run_solver(self, solver_name, poissonGLM_model_instantiation):
@@ -994,7 +998,7 @@ class TestLasso:
 
         model.set_params(regularizer=self.cls(), regularizer_strength=1)
         model.solver_name = solver_name
-        runner = model.instantiate_solver().solver_run
+        runner = model.instantiate_solver(model.compute_loss).solver_run
         runner((true_params[0] * 0.0, true_params[1]), X, y)
 
     @pytest.mark.parametrize("solver_name", ["ProximalGradient", "ProxSVRG"])
@@ -1006,7 +1010,7 @@ class TestLasso:
         # set regularizer and solver name
         model.set_params(regularizer=self.cls(), regularizer_strength=1)
         model.solver_name = solver_name
-        runner = model.instantiate_solver().solver_run
+        runner = model.instantiate_solver(model.compute_loss).solver_run
         runner(
             (jax.tree_util.tree_map(jnp.zeros_like, true_params[0]), true_params[1]),
             X.data,
@@ -1026,7 +1030,7 @@ class TestLasso:
         model.solver_name = solver_name
         model.solver_kwargs = {"tol": 10**-12}
 
-        runner = model.instantiate_solver().solver_run
+        runner = model.instantiate_solver(model.compute_loss).solver_run
         weights, intercepts = runner((true_params[0] * 0.0, true_params[1]), X, y)[0]
 
         # instantiate the glm with statsmodels
@@ -1266,12 +1270,12 @@ class TestElasticNet:
         raise_exception = not callable(loss)
         regularizer = self.cls()
         model = nmo.glm.GLM(regularizer=regularizer, regularizer_strength=(1, 0.5))
-        model._predict_and_compute_loss = loss
+        model.compute_loss = loss
         if raise_exception:
             with pytest.raises(TypeError, match="The `loss` must be a Callable"):
-                nmo.utils.assert_is_callable(model._predict_and_compute_loss, "loss")
+                nmo.utils.assert_is_callable(model.compute_loss, "loss")
         else:
-            nmo.utils.assert_is_callable(model._predict_and_compute_loss, "loss")
+            nmo.utils.assert_is_callable(model.compute_loss, "loss")
 
     @pytest.mark.parametrize("solver_name", ["ProximalGradient", "ProxSVRG"])
     def test_run_solver(self, solver_name, poissonGLM_model_instantiation):
@@ -1281,7 +1285,7 @@ class TestElasticNet:
 
         model.set_params(regularizer=self.cls(), regularizer_strength=(1, 0.5))
         model.solver_name = solver_name
-        runner = model.instantiate_solver().solver_run
+        runner = model.instantiate_solver(model.compute_loss).solver_run
         runner((true_params[0] * 0.0, true_params[1]), X, y)
 
     @pytest.mark.parametrize("solver_name", ["ProximalGradient", "ProxSVRG"])
@@ -1293,7 +1297,7 @@ class TestElasticNet:
         # set regularizer and solver name
         model.set_params(regularizer=self.cls(), regularizer_strength=(1, 0.5))
         model.solver_name = solver_name
-        runner = model.instantiate_solver().solver_run
+        runner = model.instantiate_solver(model.compute_loss).solver_run
         runner(
             (jax.tree_util.tree_map(jnp.zeros_like, true_params[0]), true_params[1]),
             X.data,
@@ -1318,7 +1322,7 @@ class TestElasticNet:
         model.solver_name = solver_name
         model.solver_kwargs = {"tol": 10**-12, "maxiter": 10000}
 
-        runner = model.instantiate_solver().solver_run
+        runner = model.instantiate_solver(model.compute_loss).solver_run
         weights, intercepts = runner((true_params[0] * 0.0, true_params[1]), X, y)[0]
 
         model.fit(X, y)
@@ -1365,7 +1369,7 @@ class TestElasticNet:
 
         # use the penalized loss function to solve optimization via Nelder-Mead
         penalized_loss = lambda p, x, y: model_PG.regularizer.penalized_loss(
-            model_PG._predict_and_compute_loss, model_PG.regularizer_strength
+            model_PG.compute_loss, model_PG.regularizer_strength
         )(
             (
                 p[1:],
@@ -1595,13 +1599,13 @@ class TestGroupLasso:
 
         regularizer = self.cls(mask=mask)
         model = nmo.glm.GLM(regularizer=regularizer, regularizer_strength=1.0)
-        model._predict_and_compute_loss = loss
+        model.compute_loss = loss
 
         if raise_exception:
             with pytest.raises(TypeError, match="The `loss` must be a Callable"):
-                nmo.utils.assert_is_callable(model._predict_and_compute_loss, "loss")
+                nmo.utils.assert_is_callable(model.compute_loss, "loss")
         else:
-            nmo.utils.assert_is_callable(model._predict_and_compute_loss, "loss")
+            nmo.utils.assert_is_callable(model.compute_loss, "loss")
 
     @pytest.mark.parametrize("solver_name", ["ProximalGradient", "ProxSVRG"])
     def test_run_solver(self, solver_name, poissonGLM_model_instantiation):
@@ -1618,7 +1622,7 @@ class TestGroupLasso:
         model.set_params(regularizer=self.cls(mask=mask), regularizer_strength=1.0)
         model.solver_name = solver_name
 
-        model.instantiate_solver()
+        model.instantiate_solver(model.compute_loss)
         model.solver_run((true_params[0] * 0.0, true_params[1]), X, y)
 
     @pytest.mark.parametrize("solver_name", ["ProximalGradient", "ProxSVRG"])
@@ -1636,16 +1640,11 @@ class TestGroupLasso:
         model.set_params(regularizer=self.cls(mask=mask), regularizer_strength=1.0)
         model.solver_name = solver_name
 
-        model.instantiate_solver()
+        model.instantiate_solver(model.compute_loss)
         state = model.solver_init_state(true_params, X, y)
         # asses that state is a NamedTuple by checking tuple type and the availability of some NamedTuple
         # specific namespace attributes
-        assert isinstance(state, tuple)
-        assert (
-            hasattr(state, "_fields")
-            and hasattr(state, "_field_defaults")
-            and hasattr(state, "_asdict")
-        )
+        assert isinstance(state, tuple | eqx.Module)
 
     @pytest.mark.parametrize("solver_name", ["ProximalGradient", "ProxSVRG"])
     def test_update_solver(self, solver_name, poissonGLM_model_instantiation):
@@ -1662,7 +1661,7 @@ class TestGroupLasso:
         model.set_params(regularizer=self.cls(mask=mask), regularizer_strength=1.0)
         model.solver_name = solver_name
 
-        model.instantiate_solver()
+        model.instantiate_solver(model.compute_loss)
 
         state = model.solver_init_state((true_params[0] * 0.0, true_params[1]), X, y)
 
@@ -1674,12 +1673,8 @@ class TestGroupLasso:
         params, state = model.solver_update(true_params, state, X, y)
         # asses that state is a NamedTuple by checking tuple type and the availability of some NamedTuple
         # specific namespace attributes
-        assert isinstance(state, tuple)
-        assert (
-            hasattr(state, "_fields")
-            and hasattr(state, "_field_defaults")
-            and hasattr(state, "_asdict")
-        )
+        assert isinstance(state, tuple | eqx.Module)
+
         # check params struct and shapes
         assert jax.tree_util.tree_structure(params) == jax.tree_util.tree_structure(
             true_params
@@ -1719,7 +1714,7 @@ class TestGroupLasso:
 
         if raise_exception:
             with pytest.raises(
-                ValueError, match="Incorrect group assignment. " "Some of the features"
+                ValueError, match="Incorrect group assignment. Some of the features"
             ):
                 model.set_params(
                     regularizer=self.cls(mask=mask), regularizer_strength=1.0
@@ -1824,7 +1819,7 @@ class TestGroupLasso:
         model.set_params(regularizer=self.cls(mask=mask), regularizer_strength=1.0)
         model.solver_name = "ProximalGradient"
 
-        runner = model.instantiate_solver().solver_run
+        runner = model.instantiate_solver(model.compute_loss).solver_run
         params, _ = runner((true_params[0] * 0.0, true_params[1]), X, y)
 
         zeros_est = params[0] == 0
@@ -1865,7 +1860,7 @@ class TestGroupLasso:
 
         if raise_exception:
             with pytest.raises(
-                ValueError, match="Incorrect group assignment. " "Some of the features"
+                ValueError, match="Incorrect group assignment. Some of the features"
             ):
                 regularizer.set_params(mask=mask)
         else:
@@ -1973,6 +1968,170 @@ class TestGroupLasso:
         )
         model.solver_name = solver_name
         model.fit(X, y)
+
+
+@pytest.mark.parametrize(
+    "regularizer",
+    [
+        nmo.regularizer.UnRegularized(),
+        nmo.regularizer.Ridge(),
+        nmo.regularizer.Lasso(),
+        nmo.regularizer.GroupLasso(mask=np.eye(5)),
+        nmo.regularizer.ElasticNet(),
+    ],
+)
+class TestPenalizedLossAuxiliaryVariables:
+    """Test that penalized_loss correctly handles auxiliary variables."""
+
+    def test_single_value_return(self, regularizer):
+        """Test backward compatibility: loss returning single value."""
+
+        def simple_loss(params, X, y):
+            return jnp.mean((y - X @ params[0] - params[1]) ** 2)
+
+        # ElasticNet requires (strength, ratio) tuple
+        reg_strength = (
+            (0.1, 0.5) if isinstance(regularizer, nmo.regularizer.ElasticNet) else 0.1
+        )
+        penalized = regularizer.penalized_loss(
+            simple_loss, regularizer_strength=reg_strength
+        )
+
+        params = (jnp.ones(5), jnp.array(0.0))
+        X = jnp.ones((10, 5))
+        y = jnp.ones(10)
+
+        result = penalized(params, X, y)
+
+        # Should return a single scalar value
+        assert isinstance(result, jnp.ndarray)
+        assert result.shape == ()
+        assert jnp.isfinite(result)
+
+    def test_tuple_return_with_aux(self, regularizer):
+        """Test that loss returning (loss, aux) preserves auxiliary variable."""
+
+        def loss_with_aux(params, X, y):
+            predictions = X @ params[0] + params[1]
+            loss = jnp.mean((y - predictions) ** 2)
+            aux = {"predictions": predictions, "mse": loss}
+            return loss, aux
+
+        # ElasticNet requires (strength, ratio) tuple
+        reg_strength = (
+            (0.1, 0.5) if isinstance(regularizer, nmo.regularizer.ElasticNet) else 0.1
+        )
+        penalized = regularizer.penalized_loss(
+            loss_with_aux, regularizer_strength=reg_strength
+        )
+
+        params = (jnp.ones(5), jnp.array(0.0))
+        X = jnp.ones((10, 5))
+        y = jnp.ones(10)
+
+        result = penalized(params, X, y)
+
+        # Should return a tuple (penalized_loss, aux)
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+
+        penalized_loss_value, aux = result
+
+        # Check that penalized loss is a scalar
+        assert isinstance(penalized_loss_value, jnp.ndarray)
+        assert penalized_loss_value.shape == ()
+        assert jnp.isfinite(penalized_loss_value)
+
+        # Check that auxiliary variable is preserved
+        assert isinstance(aux, dict)
+        assert "predictions" in aux
+        assert "mse" in aux
+        assert aux["predictions"].shape == (10,)
+
+        # Check that penalized loss > original loss (penalty added)
+        if not isinstance(regularizer, nmo.regularizer.UnRegularized):
+            assert penalized_loss_value > aux["mse"]
+
+    def test_invalid_tuple_single_element(self, regularizer):
+        """Test that single-element tuple raises error."""
+
+        def bad_loss(params, X, y):
+            return (jnp.mean((y - X @ params[0] - params[1]) ** 2),)
+
+        # ElasticNet requires (strength, ratio) tuple
+        reg_strength = (
+            (0.1, 0.5) if isinstance(regularizer, nmo.regularizer.ElasticNet) else 0.1
+        )
+        penalized = regularizer.penalized_loss(
+            bad_loss, regularizer_strength=reg_strength
+        )
+
+        params = (jnp.ones(5), jnp.array(0.0))
+        X = jnp.ones((10, 5))
+        y = jnp.ones(10)
+
+        with pytest.raises(
+            ValueError,
+            match=r"Invalid loss function return.*returns a tuple with 1 value",
+        ):
+            penalized(params, X, y)
+
+    def test_invalid_tuple_three_elements(self, regularizer):
+        """Test that 3+ element tuple raises error."""
+
+        def bad_loss(params, X, y):
+            loss = jnp.mean((y - X @ params[0] - params[1]) ** 2)
+            return loss, {"aux": 1}, {"extra": 2}
+
+        # ElasticNet requires (strength, ratio) tuple
+        reg_strength = (
+            (0.1, 0.5) if isinstance(regularizer, nmo.regularizer.ElasticNet) else 0.1
+        )
+        penalized = regularizer.penalized_loss(
+            bad_loss, regularizer_strength=reg_strength
+        )
+
+        params = (jnp.ones(5), jnp.array(0.0))
+        X = jnp.ones((10, 5))
+        y = jnp.ones(10)
+
+        with pytest.raises(
+            ValueError,
+            match=r"Invalid loss function return.*returns a tuple with 3 values",
+        ):
+            penalized(params, X, y)
+
+    def test_penalty_correctly_added_to_loss_with_aux(self, regularizer):
+        """Test that penalty is correctly added when aux variables are present."""
+
+        def loss_with_aux(params, X, y):
+            predictions = X @ params[0] + params[1]
+            loss = jnp.mean((y - predictions) ** 2)
+            return loss, {"predictions": predictions}
+
+        # Get unpenalized loss
+        params = (jnp.ones(5), jnp.array(0.0))
+        X = jnp.ones((10, 5))
+        y = jnp.zeros(10)
+
+        unpenalized_loss, _ = loss_with_aux(params, X, y)
+
+        # ElasticNet requires (strength, ratio) tuple
+        reg_strength = (
+            (1.0, 0.5) if isinstance(regularizer, nmo.regularizer.ElasticNet) else 1.0
+        )
+
+        # Get penalized loss
+        penalized = regularizer.penalized_loss(
+            loss_with_aux, regularizer_strength=reg_strength
+        )
+        penalized_loss_value, aux = penalized(params, X, y)
+
+        # Calculate expected penalty
+        expected_penalty = regularizer._penalization(params, reg_strength)
+
+        # Check that penalized loss = unpenalized loss + penalty
+        assert jnp.isclose(penalized_loss_value, unpenalized_loss + expected_penalty)
 
 
 def test_available_regularizer_match():

@@ -13,7 +13,8 @@ from numpy.typing import NDArray
 
 from .base_class import Base
 from .tree_utils import pytree_map_and_reduce
-from .type_casting import is_at_least_1d_numpy_array_like, support_pynapple
+from .type_casting import support_pynapple
+from .typing import Pytree
 
 __all__ = [
     "check_dimensionality",
@@ -22,6 +23,7 @@ __all__ = [
     "shift_time_series",
     "row_wise_kron",
     "one_over_x",
+    "get_flattener_unflattener",
 ]
 
 
@@ -159,11 +161,11 @@ def _pad_dimension(
 
 
 def nan_pad(
-    conv_time_series: Any,
+    conv_time_series: NDArray | jnp.ndarray,
     pad_size: int,
     predictor_causality: Literal["causal", "acausal", "anti-causal"] = "causal",
     axis: int = 0,
-) -> Any:
+) -> jnp.ndarray:
     """
     Add NaN padding to a convolved time series based on specified causality and axis.
 
@@ -173,10 +175,8 @@ def nan_pad(
     Parameters
     ----------
     conv_time_series :
-        The convolved time series to pad. This variable should be a pytree with arrays as leaves.
-        The structure can be one of the following:
-        1. A single array with ndim > axis.
-        2. A pytree whose leaves are arrays.
+        The convolved time series to pad. This variable should be an array
+        with ndim > axis.
     pad_size :
         The number of NaNs to concatenate as padding.
     predictor_causality : {'causal', 'acausal', 'anti-causal'}, default='causal'
@@ -189,8 +189,8 @@ def nan_pad(
 
     Returns
     -------
-    padded_conv_time_series : Any
-        The convolved time series with NaN padding. The structure matches that of `conv_time_series`.
+    padded_conv_time_series :
+        The convolved time series with NaN padding.
 
     Raises
     ------
@@ -219,35 +219,16 @@ def nan_pad(
         )
 
     # convert to jax ndarray
-    conv_time_series = jax.tree_util.tree_map(jnp.asarray, conv_time_series)
+    conv_time_series = jnp.asarray(conv_time_series)
 
     # validate the axis
     validate_axis(conv_time_series, axis)
 
-    if is_at_least_1d_numpy_array_like(conv_time_series):
-        if not np.issubdtype(conv_time_series.dtype, np.floating):
-            raise ValueError("conv_time_series must have a float dtype!")
-        return _pad_dimension(
-            conv_time_series,
-            axis,
-            pad_size,
-            predictor_causality,
-            constant_values=jnp.nan,
-        )
-
-    else:
-        if pytree_map_and_reduce(
-            lambda trial: not np.issubdtype(trial.dtype, np.floating),
-            any,
-            conv_time_series,
-        ):
-            raise ValueError("All leaves of conv_time_series must have a float dtype!")
-        return jax.tree_util.tree_map(
-            lambda trial: _pad_dimension(
-                trial, axis, pad_size, predictor_causality, constant_values=jnp.nan
-            ),
-            conv_time_series,
-        )
+    if not np.issubdtype(conv_time_series.dtype, np.floating):
+        raise ValueError("All leaves of conv_time_series must have a float dtype!")
+    return _pad_dimension(
+        conv_time_series, axis, pad_size, predictor_causality, constant_values=jnp.nan
+    )
 
 
 def _compute_index_adjust(
@@ -262,7 +243,7 @@ def _compute_index_adjust(
 
 
 def shift_time_series(
-    time_series: Any,
+    time_series: NDArray | jnp.ndarray,
     predictor_causality: Literal["causal", "anti-causal"] = "causal",
     axis: int = 0,
 ):
@@ -274,8 +255,8 @@ def shift_time_series(
     Parameters
     ----------
     time_series :
-        The time series to shift, which can be a single array or a pytree of arrays.
-        Each array should have a floating-point data type.
+        The time series to shift, must be a single array and should have a floating-point
+        data type.
     predictor_causality :
         Determines the direction of the shift:
         - 'causal': Shifts the series forward, inserting a NaN at the start.
@@ -315,44 +296,23 @@ def shift_time_series(
         )
 
     # compute the start, end indices tree
-    adjust_idx = jax.tree_util.tree_map(
-        lambda x: _compute_index_adjust(x, predictor_causality, axis), time_series
-    )
+    adjust_idx = _compute_index_adjust(time_series, predictor_causality, axis)
 
     # convert to jax ndarray
-    time_series = jax.tree_util.tree_map(jnp.asarray, time_series)
-
-    if is_at_least_1d_numpy_array_like(time_series):
-
-        if not np.issubdtype(time_series.dtype, np.floating):
-            raise ValueError("time_series must have a float dtype!")
-        return _pad_dimension(
-            jnp.take(time_series, jnp.arange(*adjust_idx), axis=axis),
-            axis,
-            1,
-            predictor_causality,
-            jnp.nan,
-        )
-    else:
-        if pytree_map_and_reduce(
-            lambda trial: not np.issubdtype(trial.dtype, np.floating), any, time_series
-        ):
-            raise ValueError("All leaves of time_series must have a float dtype!")
-        return jax.tree_util.tree_map(
-            lambda trial, idx: _pad_dimension(
-                jnp.take(trial, jnp.arange(*idx), axis=axis),
-                axis,
-                1,
-                predictor_causality,
-                jnp.nan,
-            ),
-            time_series,
-            adjust_idx,
-        )
+    time_series = jnp.asarray(time_series)
+    if not np.issubdtype(time_series.dtype, np.floating):
+        raise ValueError("time_series must have a float dtype!")
+    return _pad_dimension(
+        jnp.take(time_series, jnp.arange(*adjust_idx), axis=axis),
+        axis,
+        1,
+        predictor_causality,
+        jnp.nan,
+    )
 
 
 def row_wise_kron(
-    A: jnp.ndarray, C: jnp.ndarray, jit=False, transpose=True
+    A: jnp.ndarray, C: jnp.ndarray, jit: bool = False, transpose: bool = True
 ) -> jnp.ndarray:
     r"""Compute the row-wise Kronecker product.
 
@@ -365,9 +325,9 @@ def row_wise_kron(
         The first matrix.
     C : jax.numpy.ndarray
         The second matrix.
-    jit : bool, optional
+    jit :
         Activate Just-in-Time (JIT) compilation. Default is False.
-    transpose : bool, optional
+    transpose :
         Transpose matrices A and C before computation. Default is True.
 
     Returns
@@ -816,3 +776,34 @@ def get_env_metadata() -> dict[str, str]:
         "scikit-learn": version("scikit-learn"),
         "nemos": version("nemos"),
     }
+
+
+def get_flattener_unflattener(parameter_tree: Pytree):
+    """
+    Create functions for flattening parameter pytrees and reshaping them to their original shape.
+
+    Parameters
+    ----------
+    parameter_tree :
+        Pytree to flatten. Usually model parameters.
+
+    Returns
+    -------
+    (flattener, unflattener):
+        Tuple of two functions: first one flattens the parameters, second one resshapes the flat ones.
+    """
+    flat, struct = jax.tree_util.tree_flatten(parameter_tree)
+    shapes = [x.shape for x in flat]
+    sizes = jnp.array([x.size for x in flat], dtype=int)
+    split_indices = jnp.cumsum(sizes[:-1])
+
+    def flattener(parameter_tree):
+        flat = jax.tree_util.tree_leaves(parameter_tree)
+        return jnp.concatenate([x.flatten() for x in flat])
+
+    def unflattener(flat_params):
+        split_params = jnp.split(flat_params, split_indices)
+        split_params = [x.reshape(s) for x, s in zip(split_params, shapes)]
+        return jax.tree_util.tree_unflatten(struct, split_params)
+
+    return flattener, unflattener

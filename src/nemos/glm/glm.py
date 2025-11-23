@@ -4,14 +4,12 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Callable, Literal, NamedTuple, Optional, Tuple, Union
+from typing import Callable, Literal, NamedTuple, Optional, Tuple, Union
 
 import jax
 import jax.numpy as jnp
 from numpy.typing import ArrayLike
 from sklearn.utils import InputTags, TargetTags
-
-from nemos.third_party.jaxopt import jaxopt
 
 from .. import observation_models as obs
 from .. import tree_utils, validation
@@ -20,10 +18,10 @@ from ..base_regressor import BaseRegressor, strip_metadata
 from ..exceptions import NotFittedError
 from ..inverse_link_function_utils import resolve_inverse_link_function
 from ..pytrees import FeaturePytree
-from ..regularizer import GroupLasso, Lasso, Regularizer, Ridge
+from ..regularizer import ElasticNet, GroupLasso, Lasso, Regularizer, Ridge
 from ..solvers._compute_defaults import glm_compute_optimal_stepsize_configs
 from ..type_casting import cast_to_jax, support_pynapple
-from ..typing import DESIGN_INPUT_TYPE, RegularizerStrength
+from ..typing import DESIGN_INPUT_TYPE, RegularizerStrength, SolverState, StepResult
 from ..utils import format_repr
 from .initialize_parameters import initialize_intercept_matching_mean_rate
 
@@ -118,8 +116,8 @@ class GLM(BaseRegressor[ModelParams]):
         Please see table above for regularizer/optimizer pairings.
     solver_kwargs :
         Optional dictionary for keyword arguments that are passed to the solver when instantiated.
-        E.g. stepsize, acceleration, value_and_grad, etc.
-         See the jaxopt documentation for details on each solver's kwargs: https://jaxopt.github.io/stable/
+        E.g. stepsize, tol, acceleration, etc.
+         For details on each solver's kwargs, see `get_accepted_arguments` and `get_solver_documentation`.
 
     Attributes
     ----------
@@ -462,11 +460,13 @@ class GLM(BaseRegressor[ModelParams]):
             data = X
         return self._predict(params, data)
 
-    def _predict_and_compute_loss(
+    def compute_loss(
         self,
         params: Tuple[DESIGN_INPUT_TYPE, jnp.ndarray],
         X: DESIGN_INPUT_TYPE,
         y: jnp.ndarray,
+        *args,
+        **kwargs,
     ) -> jnp.ndarray:
         r"""Predict the rate and compute the negative log-likelihood against neural activity.
 
@@ -886,7 +886,7 @@ class GLM(BaseRegressor[ModelParams]):
 
     def _estimate_resid_degrees_of_freedom(
         self, X: DESIGN_INPUT_TYPE, n_samples: Optional[int] = None
-    ):
+    ) -> jnp.ndarray:
         """
         Estimate the degrees of freedom of the residuals.
 
@@ -921,7 +921,7 @@ class GLM(BaseRegressor[ModelParams]):
         # if the regularizer is lasso use the non-zero
         # coeff as an estimate of the dof
         # see https://arxiv.org/abs/0712.0881
-        if isinstance(self.regularizer, (GroupLasso, Lasso)):
+        if isinstance(self.regularizer, (GroupLasso, Lasso, ElasticNet)):
             resid_dof = tree_utils.pytree_map_and_reduce(
                 lambda x: ~jnp.isclose(x, jnp.zeros_like(x)),
                 lambda x: sum([jnp.sum(i, axis=0) for i in x]),
@@ -942,7 +942,7 @@ class GLM(BaseRegressor[ModelParams]):
         X: DESIGN_INPUT_TYPE,
         y: jnp.ndarray,
         init_params: Optional[ModelParams] = None,
-    ) -> Tuple[ModelParams, NamedTuple]:
+    ) -> ModelParams:
         """
         Initialize the model parameters for the optimization process.
 
@@ -1000,7 +1000,7 @@ class GLM(BaseRegressor[ModelParams]):
         y: jnp.ndarray,
         init_params,
         cast_to_jax_and_drop_nans: bool = True,
-    ) -> Union[Any, NamedTuple]:
+    ) -> SolverState:
         """Initialize the solver by instantiating its init_state, update and, run methods.
 
         This method also prepares the solver's state by using the initialized model parameters and data.
@@ -1026,7 +1026,7 @@ class GLM(BaseRegressor[ModelParams]):
 
         Returns
         -------
-        NamedTuple
+        SolverState
             The initialized solver state
 
         Examples
@@ -1046,9 +1046,7 @@ class GLM(BaseRegressor[ModelParams]):
         opt_solver_kwargs = self._optimize_solver_params(data, y)
 
         #  set up the solver init/run/update attrs
-        self.instantiate_solver(
-            self._predict_and_compute_loss, solver_kwargs=opt_solver_kwargs
-        )
+        self.instantiate_solver(self.compute_loss, solver_kwargs=opt_solver_kwargs)
 
         opt_state = self.solver_init_state(init_params, data, y)
         return opt_state
@@ -1063,7 +1061,7 @@ class GLM(BaseRegressor[ModelParams]):
         *args,
         n_samples: Optional[int] = None,
         **kwargs,
-    ) -> jaxopt.OptStep:
+    ) -> StepResult:
         """
         Update the model parameters and solver state.
 
@@ -1097,7 +1095,7 @@ class GLM(BaseRegressor[ModelParams]):
 
         Returns
         -------
-        jaxopt.OptStep
+        StepResult
             A tuple containing the updated parameters and optimization state. This tuple is
             typically used to continue the optimization process in subsequent steps.
 
@@ -1153,7 +1151,7 @@ class GLM(BaseRegressor[ModelParams]):
         )
 
     def __sklearn_clone__(self) -> GLM:
-        """Clone the PopulationGLM, dropping feature_mask."""
+        """Clone the GLM."""
         params = self.get_params(deep=False)
         klass = self.__class__(**params)
         return klass
@@ -1310,8 +1308,8 @@ class PopulationGLM(GLM):
         Please see table above for regularizer/optimizer pairings.
     solver_kwargs :
         Optional dictionary for keyword arguments that are passed to the solver when instantiated.
-        E.g. stepsize, acceleration, value_and_grad, etc.
-         See the jaxopt documentation for details on each solver's kwargs: https://jaxopt.github.io/stable/
+        E.g. stepsize, tol, acceleration, etc.
+         For details on each solver's kwargs, see `get_accepted_arguments` and `get_solver_documentation`.
     feature_mask :
         Either a matrix of shape (num_features, num_neurons) or a :meth:`nemos.pytrees.FeaturePytree` of 0s and 1s, with
         ``feature_mask[feature_name]`` of shape (num_neurons, ).
