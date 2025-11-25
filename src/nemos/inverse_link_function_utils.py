@@ -1,38 +1,11 @@
 """Validation and construction of inverse link functions."""
 
-<<<<<<< HEAD
-from typing import Any, Callable
-=======
 import functools
 from typing import TYPE_CHECKING, Any, Callable
->>>>>>> upstream/glm-hmm-em
 
 import jax
 import jax.numpy as jnp
 
-<<<<<<< HEAD
-from .observation_models import Observations
-from .utils import one_over_x
-
-LINK_NAME_TO_FUNC = {
-    "nemos.utils.one_over_x": one_over_x,
-    "jax.numpy.exp": jnp.exp,
-    "jax._src.numpy.ufuncs.exp": jnp.exp,
-    "jax.nn.softplus": jax.nn.softplus,
-    "jax._src.nn.functions.softplus": jax.nn.softplus,
-    "jax.scipy.special.expit": jax.scipy.special.expit,
-    "jax._src.scipy.special.expit": jax.scipy.special.expit,
-    "jax.lax.logistic": jax.lax.logistic,
-    "jax._src.lax.lax.logistic": jax.lax.logistic,
-    "jax.scipy.stats.norm.cdf": jax.scipy.stats.norm.cdf,
-    "jax._src.scipy.stats.norm.cdf": jax.scipy.stats.norm.cdf,
-    "softplus": jax.nn.softplus,
-    "exp": jax.numpy.exp,
-    "one_over_x": one_over_x,
-    "logistic": jax.lax.logistic,
-    "norm.cdf": jax.scipy.stats.norm.cdf,
-    "expit": jax.scipy.special.expit,
-=======
 if TYPE_CHECKING:
     from .observation_models import Observations
 
@@ -99,7 +72,6 @@ LINK_NAME_TO_FUNC = {
     "norm.cdf": norm_cdf,
     "one_over_x": one_over_x,
     "softplus": softplus,
->>>>>>> upstream/glm-hmm-em
 }
 
 
@@ -187,11 +159,7 @@ def check_inverse_link_function(inverse_link_function: Callable):
 
 
 def resolve_inverse_link_function(
-<<<<<<< HEAD
-    inverse_link_function: Any, observation_model: Observations
-=======
     inverse_link_function: Any, observation_model: "Observations"
->>>>>>> upstream/glm-hmm-em
 ) -> Callable:
     """
     Validate and resolve an inverse link function specification.
