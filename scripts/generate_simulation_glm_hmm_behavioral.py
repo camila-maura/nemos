@@ -18,6 +18,7 @@ import numpy as np
 import jax.numpy as jnp
 import jax
 import matplotlib.pyplot as plt
+import sys
 
 from nemos.glm_hmm.expectation_maximization import (
     em_glm_hmm,
@@ -30,9 +31,10 @@ from nemos.glm_hmm.expectation_maximization import (
 # SESSION PARAMETERS
 ###
 
-seed = 123                  # Random seed for reproducibility
+seed = 1                 # Random seed for reproducibility
 np.random.seed(seed)
 
+# For 100 sessions > this works fine, but 20 sessions does not yield good recovery
 n_sess = 20                 # Number of sessions to simulate
 n_trials_per_sess = 100     # Number of trials in a session
 n_timepoints = n_sess * n_trials_per_sess # Total number of timepoints
@@ -79,8 +81,8 @@ stim_vals = [-1, -0.5, -0.25, -0.125,
              -0.0625, 0, 0.0625, 0.125, 0.25, 0.5, 1]   # STimuli shown to the "mice"
 
 # Generate random sequence of stimuli for simulation
-X = np.ones((n_timepoints, n_features))
-X[:,1] = np.random.choice(stim_vals, n_timepoints)
+X = np.ones((n_timepoints, n_features-1)) # not including bias (thats why features -1)
+X = np.random.choice(stim_vals, n_timepoints)
 
 ###
 # SIMULATION
@@ -97,20 +99,21 @@ true_latent_states[0, initial_state] = 1
 
 # Initialize GLM
 glm = nmo.glm.GLM(observation_model="Bernoulli")
-glm.intercept_ = jnp.zeros((1,))
 
 # Set initial weights and simulate first timepoint
-glm.coef_ = true_projection_weights[..., initial_state].reshape(
-    true_projection_weights.shape[0],1)
+#glm.coef_ = true_projection_weights[..., initial_state].reshape(
+#    true_projection_weights.shape[0],1)
 
-# Set key for replication
+glm.intercept_ =  true_projection_weights[0,initial_state].reshape(1)
+glm.coef_ = true_projection_weights[1,initial_state].reshape(1)
+
 key = jax.random.PRNGKey(seed)
 
 # Simulate first count and proba
-res_sim = glm.simulate(key, X[:1])
+res_sim = glm.simulate(key,X[1].reshape(1,1))
 
-true_choices[0] = res_sim[0][0].item()
-choice_probas[0] = res_sim[1][0].item()
+true_choices[0] = res_sim[0][0]
+choice_probas[0] = res_sim[1][0]
 
 # Simulate remaining timepoints
 print("Simulating data...")
@@ -119,12 +122,7 @@ for t in range(1, n_timepoints):
     key, subkey = jax.random.split(key)
 
     prev_state_vec = true_latent_states[t - 1]
-
-    #print(f"PREVIOUS STATE VECTOR {prev_state_vec} ")
-    #print(f"TRANSITION PROBAS {true_transition_prob}")
     transition_probs = true_transition_prob.T @ prev_state_vec
-    #print(f"TRANSITION PROBS {transition_probs}")
-
     next_state = jax.random.choice(subkey, jnp.arange(n_states), p=transition_probs)
     #print(next_state)
     #print(true_transition_prob)
@@ -132,9 +130,12 @@ for t in range(1, n_timepoints):
     true_latent_states[t, next_state] = 1
 
     # Update weights and simulate
-    glm.coef_ = true_projection_weights[..., next_state]
+    glm.intercept_ =  true_projection_weights[0,next_state].reshape(1)
+    glm.coef_ = true_projection_weights[1,next_state].reshape(1)
+    
     key, subkey = jax.random.split(key)
-    res = glm.simulate(subkey, X[t : t + 1])
+
+    res = glm.simulate(subkey, X[t : t + 1].reshape(1,1))
 
     true_choices[t] = res[0][0]
     choice_probas[t] = res[1][0]
@@ -224,6 +225,7 @@ def fit_glm_hmm_with_em(
     ):
     is_population_glm = true_projection_weights.ndim > 2
 
+
     observation_model = nmo.observation_models.BernoulliObservations()
     likelihood_func, negative_log_likelihood_func = prepare_likelihood_func(
         is_population_glm,
@@ -246,11 +248,14 @@ def fit_glm_hmm_with_em(
 
     # use the BaseRegressor initialize_solver
     regularization = "UnRegularized"
-
-    solver_name = "ProximalGradient" if "Lasso" in regularization else "LBFGS"
+    solver_name = "LBFGS"
+    
     glm = nmo.glm.GLM(
-        observation_model=observation_model, regularizer=regularization, solver_name=solver_name
+        observation_model=observation_model, 
+        regularizer=regularization, solver_name=solver_name
     )
+    
+    print("XXXXXX", projection_weights_initial_guess[1:])
     glm.instantiate_solver(partial_hmm_negative_log_likelihood)
     solver_run = glm._solver_run
 
@@ -262,7 +267,7 @@ def fit_glm_hmm_with_em(
         (learned_coef, learned_intercept),
         final_state,
     ) = em_glm_hmm(
-        X[:, 1:],
+        X,
         jnp.squeeze(true_choices),
         initial_prob=initial_prob_initial_guess,
         transition_prob=transition_prob_initial_guess,
@@ -270,7 +275,7 @@ def fit_glm_hmm_with_em(
         inverse_link_function=inverse_link_function,
         likelihood_func=likelihood_func,
         solver_run=solver_run,
-        tol=10**-10,
+        tol=10**-5,
     )
     (
         _,
@@ -280,7 +285,7 @@ def fit_glm_hmm_with_em(
         _,
         _,
     ) = forward_backward(
-        X[:, 1:],  # drop intercept
+        X,  
         true_choices,
         learned_initial_prob,
         learned_transition,
@@ -353,7 +358,7 @@ print("Initial transition probability guess \n", transition_prob_initial_guess)
 print("--Check it sums to 1", transition_prob_initial_guess.sum(axis=1))
 
 log_likelihoods[initialization_setting] = fit_glm_hmm_with_em(
-        X,
+        X.reshape(n_timepoints,n_features-1),
         true_choices,
         true_latent_states,
         true_projection_weights,
@@ -387,7 +392,7 @@ print("Initial transition probability guess \n", transition_prob_initial_guess)
 print("--Check it sums to 1", transition_prob_initial_guess.sum(axis=1))
 
 log_likelihoods[initialization_setting] = fit_glm_hmm_with_em(
-        X,
+        X.reshape(n_timepoints,n_features-1),
         true_choices,
         true_latent_states,
         true_projection_weights,
@@ -416,7 +421,7 @@ compare_likelihoods(log_likelihoods)
 # Pending I also should calculate the true log likelihood of the data given the true parameters
 # Move to implementation of K means initialization and then come back to these issues.
 
-# %%
+
 
 # Notes for notebook
 # NOTE: add an admonition on the dirichlet distribution on the notebook
