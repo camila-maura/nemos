@@ -141,6 +141,8 @@ for t in range(1, n_timepoints):
     print(f"Simulated timepoint {t+1}/{n_timepoints}", end="\r")
 print("\nSimulation complete.")
 
+print("Computing true likelihood of the data given the true parameters...")
+
 ###
 # UTILS
 ###
@@ -303,6 +305,22 @@ def fit_glm_hmm_with_em(
         initialization_setting
     )
     
+    fig = plt.figure(figsize=(5, 2.5), dpi=80, facecolor='w', edgecolor='k')
+    #sess_id = 0  # session id; can choose any index between 0 and num_sess-1
+    cols = ['#ff7f00', '#4daf4a', '#377eb8']
+    print(posteriors.shape)
+    for k in range(n_states):
+        plt.plot(posteriors[0:100, k], label="Recovered", ls='--',lw=2,
+                color=cols[k])
+        plt.plot(true_latent_states[0:100, k], label="Generative", ls='-', lw=1,
+                color=cols[k])
+    plt.ylim((-0.01, 1.01))
+    plt.yticks([0, 0.5, 1], fontsize = 10)
+    plt.xlabel("trial #", fontsize = 15)
+    plt.ylabel("p(state)", fontsize = 15)
+    plt.legend()
+    plt.show()
+    
     return log_likelihood_em
 
 
@@ -334,7 +352,6 @@ transition_prob_initial_guess[np.diag_indices(true_transition_prob.shape[1])] = 
 print("Initial transition probability guess \n", transition_prob_initial_guess)
 print("--Check it sums to 1", transition_prob_initial_guess.sum(axis=1))
 
-
 log_likelihoods[initialization_setting] = fit_glm_hmm_with_em(
         X,
         true_choices,
@@ -346,8 +363,10 @@ log_likelihoods[initialization_setting] = fit_glm_hmm_with_em(
         initialization_setting
 )
 print("\n Fitting complete.")
+
+
 ###
-# 2. FIT SIMULATED DATA WITH ABSOLUTELY RANDOM INITIALIZATION
+# 2. FIT SIMULATED DATA WITH RANDOM INITIALIZATION
 ###
 initialization_setting = "random_init"
 print(f"Fitting data with {initialization_setting} initialization...")
@@ -386,25 +405,15 @@ def compare_likelihoods(log_likelihoods):
     return None 
 
 ###
-# 3. FIT SIMULATED DATA WITH "TILTED" INITIALIZATION
-# As in Iris paper
-###
-
-###
-# 4. FIT SIMULATED DATA WITH K-MEANS ALGORITHM
-
-###
-###
 # 5. COMPARE LIKELIHOODS
 ###
 compare_likelihoods(log_likelihoods)
-# Okay absolutely random init in this case seems to work better than slightly perturbed true params, and the difference is pretty small... 
-# - Maybe the simulation is too "easy"? Also the correlation with the third state is pretty low in both cases...
-# - Maybe there's a bug somewhere in the simulation?
-# - I am not getting the right likelihood? -> According to documentation, I am getting the total log likelihood of the sequence given the model parameters. Cant quite figure out what is off but for sure the likelihood result is different from the ssm implementation.
-# - I also should calculate the true log likelihood of the data given the true parameters to have a better idea of how well we are doing.
-# - Also should plot the most likely sequence of states vs. true states
 
+
+# Okay absolutely random init in this case seems to work better than slightly perturbed true params, and the difference is pretty small... Although unexpected, the difference in goodness of fit increases with sample size - better initial guesses get better results when the sample size is larger.
+# For some reason, ssm implementation seems to work better for a sample size of 20 *100, whilst here the results are awful.
+# I want to get the summed likelihood as opposed to mean - pending
+# Pending I also should calculate the true log likelihood of the data given the true parameters
 # Move to implementation of K means initialization and then come back to these issues.
 
 # %%
