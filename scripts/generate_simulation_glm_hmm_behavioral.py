@@ -176,7 +176,6 @@ def fit_glm_hmm_with_em(
     )
     inverse_link_function = observation_model.default_inverse_link_function
 
-
     def partial_hmm_negative_log_likelihood(
                 weights, design_matrix, observations, posterior_prob):
         return hmm_negative_log_likelihood(
@@ -187,7 +186,6 @@ def fit_glm_hmm_with_em(
             inverse_link_function=inverse_link_function,
             negative_log_likelihood_func=negative_log_likelihood_func,
         )
-
 
     # use the BaseRegressor initialize_solver
     regularization = "UnRegularized"
@@ -205,7 +203,7 @@ def fit_glm_hmm_with_em(
         learned_initial_prob,
         learned_transition,
         (learned_coef, learned_intercept),
-        _,
+        final_state,
     ) = em_glm_hmm(
         X[:, 1:],
         jnp.squeeze(true_choices),
@@ -233,6 +231,8 @@ def fit_glm_hmm_with_em(
         likelihood_func=likelihood_func,
         inverse_link_function=observation_model.default_inverse_link_function,
     )
+
+    print("LLLLLLL", final_state.data_log_likelihood)
 
     # find state mapping
     corr_matrix = np.corrcoef(true_latent_states.T, posteriors.T)[
@@ -398,7 +398,7 @@ compare_likelihoods(log_likelihoods)
 # Okay absolutely random init in this case seems to work better than slightly perturbed true params, and the difference is pretty small... 
 # - Maybe the simulation is too "easy"? Also the correlation with the third state is pretty low in both cases...
 # - Maybe there's a bug somewhere in the simulation?
-# - I am not getting the right likelihood? -> According to documentation, I am getting the total log likelihood of the sequence given the model parameters. Cant quite figure out what is off but for sure the likelihood is different from the ssm implementation.
+# - I am not getting the right likelihood? -> According to documentation, I am getting the total log likelihood of the sequence given the model parameters. Cant quite figure out what is off but for sure the likelihood result is different from the ssm implementation.
 # - I also should calculate the true log likelihood of the data given the true parameters to have a better idea of how well we are doing.
 # - Also should plot the most likely sequence of states vs. true states
 
