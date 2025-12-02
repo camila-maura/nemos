@@ -333,6 +333,35 @@ def fit_glm_hmm_with_em(
 log_likelihoods = {}
 
 ###
+# Import simulation -> when i import, it does NOT work. 
+###
+'''
+# Saved and imported from ssm notebook
+npzfile = np.load("scripts/ssm_input.npz")
+
+# True initial prob, literally copied
+true_initial_prob = jnp.array([0.95, 0.025, 0.025]) 
+
+# True transition prob, copied
+true_transition_prob = np.array(
+    [[0.98, 0.01, 0.01], 
+      [0.05, 0.92, 0.03], 
+      [0.03, 0.03, 0.94]]
+)
+
+# True weights
+true_projection_weights = np.array([
+    [1, -3, 3],             # Bias - Intercept
+    [6, 2, 2],              # Stimulus
+])
+
+# Simulation imported from ssm
+true_latent_states = npzfile["true_latents"]
+true_choices = npzfile["true_choices"]
+X = npzfile["inputs"]
+print(X)
+'''
+###
 # 1. FIT SIMULATED DATA WITH A TINY DEVIATION FROM TRUE PARAMETERS
 ###
 initialization_setting = "small_perturbation"
