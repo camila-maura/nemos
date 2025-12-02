@@ -6,6 +6,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from hmmlearn import hmm
+from numba.cpython.mathimpl import log_impl
 
 from nemos.fetch import fetch_data
 from nemos.glm import GLM
@@ -13,7 +14,7 @@ from nemos.glm_hmm.expectation_maximization import (
     GLMHMMState,
     backward_pass,
     check_log_likelihood_increment,
-    compute_xi,
+    compute_xi_log,
     em_glm_hmm,
     forward_backward,
     forward_pass,
@@ -147,7 +148,7 @@ def prepare_solver_for_m_step_single_neuron(
         initial_prob,
         transition_prob,
         (coef, intercept),
-        likelihood_func=likelihood,
+        log_likelihood_func=likelihood,
         inverse_link_function=obs.default_inverse_link_function,
         is_new_session=new_sess.astype(bool),
     )
@@ -238,7 +239,7 @@ def prepare_gammas_and_xis_for_m_step_single_neuron(
         initial_prob,
         transition_prob,
         (coef, intercept),
-        likelihood_func=likelihood,
+        log_likelihood_func=likelihood,
         inverse_link_function=obs.default_inverse_link_function,
         is_new_session=new_sess.astype(bool),
     )
@@ -495,7 +496,8 @@ class TestForwardBackward:
         [
             lambda x: x,
             partial(
-                jax.jit, static_argnames=["likelihood_func", "inverse_link_function"]
+                jax.jit,
+                static_argnames=["log_likelihood_func", "inverse_link_function"],
             ),
         ],
     )
@@ -532,29 +534,34 @@ class TestForwardBackward:
 
         obs = BernoulliObservations()
 
-        likelihood = jax.vmap(
-            lambda x, z: obs.likelihood(x, z, aggregate_sample_scores=lambda w: w),
+        log_likelihood = jax.vmap(
+            lambda x, z: obs.log_likelihood(x, z, aggregate_sample_scores=lambda w: w),
             in_axes=(None, 1),
             out_axes=1,
         )
 
         decorated_forward_backward = decorator(forward_backward)
-        gammas_nemos, xis_nemos, ll_nemos, ll_norm_nemos, alphas_nemos, betas_nemos = (
-            decorated_forward_backward(
-                X[:, 1:],  # drop intercept
-                y,
-                initial_prob,
-                transition_prob,
-                (coef, intercept),
-                likelihood_func=likelihood,
-                inverse_link_function=obs.default_inverse_link_function,
-                is_new_session=new_sess.astype(bool),
-            )
+        (
+            gammas_nemos,
+            xis_nemos,
+            ll_nemos,
+            ll_norm_nemos,
+            log_alphas_nemos,
+            log_betas_nemos,
+        ) = decorated_forward_backward(
+            X[:, 1:],  # drop intercept
+            y,
+            jnp.log(initial_prob),
+            jnp.log(transition_prob),
+            (coef, intercept),
+            log_likelihood_func=log_likelihood,
+            inverse_link_function=obs.default_inverse_link_function,
+            is_new_session=new_sess.astype(bool),
         )
 
         # First testing alphas and betas because they are computed first
-        np.testing.assert_almost_equal(alphas_nemos, alphas, decimal=8)
-        np.testing.assert_almost_equal(betas_nemos, betas, decimal=8)
+        np.testing.assert_almost_equal(log_alphas_nemos, np.log(alphas), decimal=8)
+        np.testing.assert_almost_equal(log_betas_nemos, np.log(betas), decimal=8)
 
         # testing log likelihood and normalized log likelihood
         np.testing.assert_almost_equal(ll_nemos, ll_orig, decimal=8)
@@ -580,8 +587,8 @@ class TestForwardBackward:
 
         obs = PoissonObservations()
 
-        likelihood = jax.vmap(
-            lambda x, z: obs.likelihood(x, z, aggregate_sample_scores=lambda w: w),
+        log_likelihood = jax.vmap(
+            lambda x, z: obs.log_likelihood(x, z, aggregate_sample_scores=lambda w: w),
             in_axes=(None, 1),
             out_axes=1,
         )
@@ -589,17 +596,17 @@ class TestForwardBackward:
         predicted_rate_given_state = obs.default_inverse_link_function(
             X @ coef + intercept
         )
-        conditionals = likelihood(y, predicted_rate_given_state)
+        log_conditionals = log_likelihood(y, predicted_rate_given_state)
 
-        alphas, normalization = forward_pass(
-            initial_prob, transition_prob, conditionals, new_sess
+        log_alphas, log_normalization = forward_pass(
+            np.log(initial_prob), np.log(transition_prob), log_conditionals, new_sess
         )
 
         alphas_numpy, normalization_numpy = forward_step_numpy(
-            conditionals, new_sess, initial_prob, transition_prob
+            np.exp(log_conditionals), new_sess, initial_prob, transition_prob
         )
-        np.testing.assert_almost_equal(alphas_numpy, alphas)
-        np.testing.assert_almost_equal(normalization_numpy, normalization)
+        np.testing.assert_almost_equal(np.log(alphas_numpy), log_alphas)
+        np.testing.assert_almost_equal(np.log(normalization_numpy), log_normalization)
 
     @pytest.mark.requires_x64
     def test_for_loop_backward_step(self, generate_data_multi_state):
@@ -614,8 +621,8 @@ class TestForwardBackward:
         )
         obs = PoissonObservations()
 
-        likelihood = jax.vmap(
-            lambda x, z: obs.likelihood(x, z, aggregate_sample_scores=lambda w: w),
+        log_likelihood = jax.vmap(
+            lambda x, z: obs.log_likelihood(x, z, aggregate_sample_scores=lambda w: w),
             in_axes=(None, 1),
             out_axes=1,
         )
@@ -623,17 +630,22 @@ class TestForwardBackward:
         predicted_rate_given_state = obs.default_inverse_link_function(
             X @ coef + intercept
         )
-        conditionals = likelihood(y, predicted_rate_given_state)
+        log_conditionals = log_likelihood(y, predicted_rate_given_state)
 
-        alphas, normalization = forward_pass(
-            initial_prob, transition_prob, conditionals, new_sess
+        log_alphas, log_normalization = forward_pass(
+            np.log(initial_prob), np.log(transition_prob), log_conditionals, new_sess
         )
 
-        betas = backward_pass(transition_prob, conditionals, normalization, new_sess)
+        log_betas = backward_pass(
+            np.log(transition_prob), log_conditionals, log_normalization, new_sess
+        )
         betas_numpy = backward_step_numpy(
-            conditionals, normalization, new_sess, transition_prob
+            np.exp(log_conditionals),
+            np.exp(log_normalization),
+            new_sess,
+            transition_prob,
         )
-        np.testing.assert_almost_equal(betas_numpy, betas)
+        np.testing.assert_almost_equal(np.log(betas_numpy), log_betas)
 
     def test_single_state_estep(self, single_state_inputs):
         """
@@ -645,38 +657,39 @@ class TestForwardBackward:
         initial_prob, transition_prob, coef, intercept, X, rate, y = single_state_inputs
         obs = PoissonObservations()
 
-        likelihood = jax.vmap(
-            lambda x, z: obs.likelihood(x, z, aggregate_sample_scores=lambda w: w),
+        log_likelihood = jax.vmap(
+            lambda x, z: obs.log_likelihood(x, z, aggregate_sample_scores=lambda w: w),
             in_axes=(None, 1),
             out_axes=1,
         )
-        conditionals = likelihood(y, rate)
+        log_conditionals = log_likelihood(y, rate)
         new_sess = np.zeros(10)
         new_sess[0] = 1
-        alphas, norm = forward_pass(
-            initial_prob, transition_prob, conditionals, new_sess
+        log_alphas, log_norm = forward_pass(
+            np.log(initial_prob), np.log(transition_prob), log_conditionals, new_sess
         )
-        betas = backward_pass(transition_prob, conditionals, norm, new_sess)
+        log_betas = backward_pass(
+            np.log(transition_prob), log_conditionals, log_norm, new_sess
+        )
 
-        # check that the normalization factor reduces to the p(x_t | z_t)
-        np.testing.assert_array_almost_equal(norm, conditionals[:, 0])
+        # check that the normalization factor reduces to the log p(x_t | z_t)
+        np.testing.assert_array_almost_equal(log_norm, log_conditionals[:, 0])
 
-        # Note: alphas * betas is p(z_t | X), so it's automatically ones if the
-        # two assertions passes, no need to check explicitly for  p(z_t | X).
-        np.testing.assert_array_almost_equal(np.ones_like(alphas), alphas)
-        np.testing.assert_array_almost_equal(np.ones_like(betas), betas)
+        np.testing.assert_array_almost_equal(np.zeros_like(log_alphas), log_alphas)
+        np.testing.assert_array_almost_equal(np.zeros_like(log_betas), log_betas)
 
         # xis are a sum of the ones over valid entries
-        xis = compute_xi(
-            alphas,
-            betas,
-            conditionals,
-            norm,
+        log_xis = compute_xi_log(
+            log_alphas,
+            log_betas,
+            log_conditionals,
+            log_norm,
             new_sess,
-            transition_prob,
+            np.log(transition_prob),
         )
+        xis = jnp.exp(log_xis)
         np.testing.assert_array_almost_equal(
-            np.array([[alphas.shape[0] - sum(new_sess)]]).astype(xis), xis
+            np.array([[log_alphas.shape[0] - sum(new_sess)]]).astype(xis), xis
         )
 
 
@@ -781,8 +794,8 @@ class TestMStep:
 
         (
             optimized_projection_weights_nemos,
-            new_initial_prob_nemos,
-            new_transition_prob_nemos,
+            log_initial_prob_nemos,
+            log_transition_prob_nemos,
             state,
         ) = run_m_step(
             X[:, 1:],  # drop intercept column
@@ -793,6 +806,10 @@ class TestMStep:
             is_new_session=new_sess.astype(bool),
             solver_run=solver.run,
         )
+
+        # Convert back to probability space for comparison with reference
+        new_initial_prob_nemos = np.exp(log_initial_prob_nemos)
+        new_transition_prob_nemos = np.exp(log_transition_prob_nemos)
 
         n_ll_nemos = partial_hmm_negative_log_likelihood(
             optimized_projection_weights_nemos,
@@ -867,42 +884,44 @@ class TestMStep:
         initial_prob, transition_prob, coef, intercept, X, rate, y = single_state_inputs
         obs = PoissonObservations()
 
-        likelihood = jax.vmap(
-            lambda x, z: obs.likelihood(x, z, aggregate_sample_scores=lambda w: w),
+        log_likelihood = jax.vmap(
+            lambda x, z: obs.log_likelihood(x, z, aggregate_sample_scores=lambda w: w),
             in_axes=(None, 1),
             out_axes=1,
         )
-        conditionals = likelihood(y, rate)
+        log_conditionals = log_likelihood(y, rate)
         new_sess = np.zeros(10)
         new_sess[0] = 1
-        alphas, norm = forward_pass(
-            initial_prob, transition_prob, conditionals, new_sess
+        log_alphas, log_norm = forward_pass(
+            np.log(initial_prob), np.log(transition_prob), log_conditionals, new_sess
         )
-        betas = backward_pass(transition_prob, conditionals, norm, new_sess)
+        log_betas = backward_pass(
+            np.log(transition_prob), log_conditionals, log_norm, new_sess
+        )
 
         # xis are a sum of the ones over valid entires
-        xis = compute_xi(
-            alphas,
-            betas,
-            conditionals,
-            norm,
+        log_xis = compute_xi_log(
+            log_alphas,
+            log_betas,
+            log_conditionals,
+            log_norm,
             new_sess,
-            transition_prob,
+            np.log(transition_prob),
         )
-
+        xis = np.exp(log_xis)
         partial_hmm_negative_log_likelihood, solver = (
             prepare_partial_hmm_nll_single_neuron(obs)
         )
 
         (
             optimized_projection_weights_nemos,
-            new_initial_prob_nemos,
-            new_transition_prob_nemos,
+            log_initial_prob_nemos,
+            log_transition_prob_nemos,
             state,
         ) = run_m_step(
             X,
             y,
-            alphas * betas,
+            np.exp(log_alphas + log_betas),
             xis,
             (np.zeros_like(coef), np.zeros_like(intercept)),
             is_new_session=new_sess.astype(bool),
@@ -920,17 +939,17 @@ class TestMStep:
             glm.intercept_, optimized_projection_weights_nemos[1].flatten()
         )
 
-        # test that the transition and initial probabilities are all ones.
+        # test that the transition and initial probabilities are all ones (log(1) = 0).
         np.testing.assert_array_equal(
-            new_initial_prob_nemos, np.ones_like(initial_prob)
+            log_initial_prob_nemos, np.zeros_like(initial_prob)
         )
         np.testing.assert_array_equal(
-            new_transition_prob_nemos, np.ones_like(new_transition_prob_nemos)
+            log_transition_prob_nemos, np.zeros_like(log_transition_prob_nemos)
         )
 
         # check expected shapes
-        assert new_transition_prob_nemos.shape == (1, 1)
-        assert new_initial_prob_nemos.shape == (1,)
+        assert log_transition_prob_nemos.shape == (1, 1)
+        assert log_initial_prob_nemos.shape == (1,)
         assert optimized_projection_weights_nemos[0].shape == (2, 1)
         assert optimized_projection_weights_nemos[1].shape == (1,)
 
@@ -952,8 +971,8 @@ class TestMStep:
 
         (
             optimized_projection_weights_nemos,
-            new_initial_prob,
-            new_transition_prob,
+            log_initial_prob,
+            log_transition_prob,
             state,
         ) = run_m_step(
             X,
@@ -966,6 +985,10 @@ class TestMStep:
             dirichlet_prior_alphas_transition=alphas_transition,
             dirichlet_prior_alphas_init_prob=alphas_init,
         )
+
+        # Convert back to probability space for gradient checks
+        new_initial_prob = np.exp(log_initial_prob)
+        new_transition_prob = np.exp(log_transition_prob)
 
         lagrange_multiplier = -jax.grad(expected_log_likelihood_wrt_transitions)(
             new_transition_prob, xis, dirichlet_alphas=alphas_transition
@@ -1027,8 +1050,8 @@ class TestMStep:
 
         (
             optimized_projection_weights_nemos,
-            new_initial_prob,
-            new_transition_prob,
+            log_initial_prob,
+            log_transition_prob,
             state,
         ) = run_m_step(
             X,
@@ -1041,6 +1064,8 @@ class TestMStep:
             dirichlet_prior_alphas_transition=alphas_transition,
             dirichlet_prior_alphas_init_prob=alphas_init,
         )
+        # Convert back to probability space
+        new_initial_prob = np.exp(log_initial_prob)
         np.testing.assert_array_almost_equal(
             new_initial_prob, np.eye(new_initial_prob.shape[0])[state_idx]
         )
@@ -1068,8 +1093,8 @@ class TestMStep:
 
         (
             optimized_projection_weights_nemos,
-            new_initial_prob,
-            new_transition_prob,
+            log_initial_prob,
+            log_transition_prob,
             state,
         ) = run_m_step(
             X,
@@ -1082,6 +1107,9 @@ class TestMStep:
             dirichlet_prior_alphas_transition=alphas_transition,
             dirichlet_prior_alphas_init_prob=alphas_init,
         )
+        # Convert back to probability space
+        new_initial_prob = np.exp(log_initial_prob)
+        new_transition_prob = np.exp(log_transition_prob)
         np.testing.assert_array_almost_equal(
             new_transition_prob[row, :], np.eye(new_initial_prob.shape[0])[col]
         )
@@ -1259,8 +1287,8 @@ class TestMStep:
 
         (
             optimized_projection_weights_nemos,
-            new_initial_prob_nemos,
-            new_transition_prob_nemos,
+            log_initial_prob_nemos,
+            log_transition_prob_nemos,
             state,
         ) = run_m_step(
             X[:, 1:],  # drop intercept column
@@ -1273,6 +1301,10 @@ class TestMStep:
             dirichlet_prior_alphas_init_prob=dirichlet_prior_initial_prob,
             dirichlet_prior_alphas_transition=dirichlet_prior_transition_prob,
         )
+
+        # Convert back to probability space for comparison with reference
+        new_initial_prob_nemos = np.exp(log_initial_prob_nemos)
+        new_transition_prob_nemos = np.exp(log_transition_prob_nemos)
 
         # NLL with nemos input
         n_ll_nemos = partial_hmm_negative_log_likelihood(
@@ -1346,7 +1378,6 @@ class TestEMAlgorithm:
             is_population_glm,
             obs.log_likelihood,
             obs._negative_log_likelihood,
-            is_log=True,
         )
         inverse_link_function = obs.default_inverse_link_function
 
@@ -1407,7 +1438,7 @@ class TestEMAlgorithm:
             learned_initial_prob,
             learned_transition,
             (learned_coef, learned_intercept),
-            likelihood_func=likelihood_func,
+            log_likelihood_func=likelihood_func,
             inverse_link_function=obs.default_inverse_link_function,
         )
         (
@@ -1420,10 +1451,10 @@ class TestEMAlgorithm:
         ) = forward_backward(
             X[:, 1:],  # drop intercept
             y,
-            initial_prob,
-            transition_prob,
+            jnp.log(initial_prob),
+            jnp.log(transition_prob),
             (coef, intercept),
-            likelihood_func=likelihood_func,
+            log_likelihood_func=likelihood_func,
             inverse_link_function=obs.default_inverse_link_function,
         )
         assert (
@@ -1460,7 +1491,6 @@ class TestEMAlgorithm:
             is_population_glm,
             obs.log_likelihood,
             obs._negative_log_likelihood,
-            is_log=True,
         )
         inverse_link_function = obs.default_inverse_link_function
 
@@ -1500,15 +1530,15 @@ class TestEMAlgorithm:
             joint_posterior_noisy_params,
             log_likelihood_noisy_params,
             log_likelihood_norm_noisy_params,
-            alphas_noisy_params,
-            betas_noisy_params,
+            log_alphas_noisy_params,
+            log_betas_noisy_params,
         ) = forward_backward(
             X[:, 1:],  # drop intercept
             y,
-            init_pb,
-            transition_pb,
+            jnp.log(init_pb),
+            jnp.log(transition_pb),
             (proj_weights[1:], proj_weights[:1]),
-            likelihood_func=likelihood_func,
+            log_likelihood_func=likelihood_func,
             inverse_link_function=obs.default_inverse_link_function,
         )
 
@@ -1524,7 +1554,7 @@ class TestEMAlgorithm:
             learned_initial_prob,
             learned_transition,
             (learned_coef, learned_intercept),
-            _,
+            state,
         ) = em_glm_hmm(
             X[:, 1:],
             jnp.squeeze(y),
@@ -1549,7 +1579,7 @@ class TestEMAlgorithm:
             learned_initial_prob,
             learned_transition,
             (learned_coef, learned_intercept),
-            likelihood_func=likelihood_func,
+            log_likelihood_func=likelihood_func,
             inverse_link_function=obs.default_inverse_link_function,
         )
 
@@ -1603,7 +1633,7 @@ def test_e_and_m_step_for_population(generate_data_multi_state_population):
         initial_prob,
         transition_prob,
         (coef, intercept),
-        likelihood_func=likelihood,
+        log_likelihood_func=likelihood,
         inverse_link_function=obs.default_inverse_link_function,
         is_new_session=new_sess.astype(bool),
     )
@@ -1739,8 +1769,8 @@ class TestConvergence:
         """Test that convergence checker detects convergence with small likelihood change."""
 
         state = GLMHMMState(
-            initial_prob=jnp.array([0.5, 0.5]),
-            transition_matrix=jnp.eye(2),
+            log_initial_prob=jnp.array([0.5, 0.5]),
+            log_transition_matrix=jnp.eye(2),
             glm_params=(jnp.zeros((2, 2)), jnp.zeros(2)),
             data_log_likelihood=-0.0,
             previous_data_log_likelihood=-0.0001,  # Very small change
@@ -1758,8 +1788,8 @@ class TestConvergence:
         """Test that convergence checker detects non-convergence with large likelihood change."""
 
         state = GLMHMMState(
-            initial_prob=jnp.array([0.5, 0.5]),
-            transition_matrix=jnp.eye(2),
+            log_initial_prob=jnp.array([0.5, 0.5]),
+            log_transition_matrix=jnp.eye(2),
             glm_params=(jnp.zeros((2, 2)), jnp.zeros(2)),
             data_log_likelihood=-100.0,
             previous_data_log_likelihood=-130.0,  # Large change
@@ -1774,8 +1804,8 @@ class TestConvergence:
         """Test convergence checker behavior on first iteration."""
 
         state = GLMHMMState(
-            initial_prob=jnp.array([0.5, 0.5]),
-            transition_matrix=jnp.eye(2),
+            log_initial_prob=jnp.array([0.5, 0.5]),
+            log_transition_matrix=jnp.eye(2),
             glm_params=(jnp.zeros((2, 2)), jnp.zeros(2)),
             data_log_likelihood=-jnp.inf,
             previous_data_log_likelihood=-jnp.inf,
@@ -1809,7 +1839,9 @@ class TestConvergence:
 
         obs = BernoulliObservations()
         likelihood_func, negative_log_likelihood_func = prepare_likelihood_func(
-            False, obs.log_likelihood, obs._negative_log_likelihood, is_log=True
+            False,
+            obs.log_likelihood,
+            obs._negative_log_likelihood,
         )
 
         def partial_hmm_negative_log_likelihood(
@@ -1870,7 +1902,9 @@ class TestConvergence:
 
         obs = BernoulliObservations()
         likelihood_func, negative_log_likelihood_func = prepare_likelihood_func(
-            False, obs.log_likelihood, obs._negative_log_likelihood, is_log=True
+            False,
+            obs.log_likelihood,
+            obs._negative_log_likelihood,
         )
 
         def partial_hmm_negative_log_likelihood(
@@ -1926,7 +1960,7 @@ class TestConvergence:
 
         obs = BernoulliObservations()
         likelihood_func, negative_log_likelihood_func = prepare_likelihood_func(
-            False, obs.log_likelihood, obs._negative_log_likelihood, is_log=True
+            False, obs.log_likelihood, obs._negative_log_likelihood
         )
 
         def partial_hmm_negative_log_likelihood(
@@ -1988,7 +2022,7 @@ class TestConvergence:
 
         obs = BernoulliObservations()
         likelihood_func, negative_log_likelihood_func = prepare_likelihood_func(
-            False, obs.log_likelihood, obs._negative_log_likelihood, is_log=True
+            False, obs.log_likelihood, obs._negative_log_likelihood
         )
 
         def partial_hmm_negative_log_likelihood(
@@ -2069,7 +2103,9 @@ class TestConvergence:
 
         obs = BernoulliObservations()
         likelihood_func, negative_log_likelihood_func = prepare_likelihood_func(
-            False, obs.log_likelihood, obs._negative_log_likelihood, is_log=True
+            False,
+            obs.log_likelihood,
+            obs._negative_log_likelihood,
         )
 
         def partial_hmm_negative_log_likelihood(
@@ -2138,7 +2174,9 @@ class TestConvergence:
 
         obs = BernoulliObservations()
         likelihood_func, negative_log_likelihood_func = prepare_likelihood_func(
-            False, obs.log_likelihood, obs._negative_log_likelihood, is_log=True
+            False,
+            obs.log_likelihood,
+            obs._negative_log_likelihood,
         )
 
         def partial_hmm_negative_log_likelihood(
@@ -2275,7 +2313,7 @@ class TestCompilation:
 
         obs = BernoulliObservations()
         likelihood_func, negative_log_likelihood_func = prepare_likelihood_func(
-            False, obs.log_likelihood, obs._negative_log_likelihood, is_log=True
+            False, obs.log_likelihood, obs._negative_log_likelihood
         )
 
         def partial_hmm_negative_log_likelihood(
@@ -2377,7 +2415,10 @@ class TestCompilation:
 
         obs = BernoulliObservations()
         likelihood_func, negative_log_likelihood_func = prepare_likelihood_func(
-            False, obs.log_likelihood, obs._negative_log_likelihood, is_log=True
+            False,
+            obs.log_likelihood,
+            obs._negative_log_likelihood,
+
         )
 
         def partial_hmm_negative_log_likelihood(
@@ -2401,7 +2442,7 @@ class TestCompilation:
             initial_prob,
             transition_prob,
             (coef, intercept),
-            likelihood_func=likelihood_func,
+            log_likelihood_func=likelihood_func,
             inverse_link_function=obs.default_inverse_link_function,
             is_new_session=new_sess.astype(bool),
         )
@@ -2419,7 +2460,7 @@ class TestCompilation:
             initial_prob_new,
             transition_prob_new,
             (coef_new, intercept_new),
-            likelihood_func=likelihood_func,
+            log_likelihood_func=likelihood_func,
             inverse_link_function=obs.default_inverse_link_function,
             is_new_session=new_sess.astype(bool),
         )
@@ -2459,9 +2500,8 @@ class TestPytreeSupport:
         obs = PoissonObservations()
         likelihood_func, _ = prepare_likelihood_func(
             is_population_glm=False,
-            likelihood_func=obs.log_likelihood,
+            log_likelihood_func=obs.log_likelihood,
             negative_log_likelihood_func=obs._negative_log_likelihood,
-            is_log=True,
         )
 
         # Test with standard arrays (reference)
@@ -2475,8 +2515,8 @@ class TestPytreeSupport:
         ) = forward_backward(
             X,
             y,
-            initial_prob,
-            transition_prob,
+            jnp.log(initial_prob),
+            jnp.log(transition_prob),
             (coef, intercept),
             obs.default_inverse_link_function,
             likelihood_func,
@@ -2487,8 +2527,8 @@ class TestPytreeSupport:
         posteriors, joint_posterior, ll, ll_norm, alphas, betas = forward_backward(
             X_tree,
             y,
-            initial_prob,
-            transition_prob,
+            jnp.log(initial_prob),
+            jnp.log(transition_prob),
             (coef_tree, intercept),
             obs.default_inverse_link_function,
             likelihood_func,
@@ -2580,9 +2620,8 @@ class TestPytreeSupport:
         obs = PoissonObservations()
         likelihood_func, vmap_nll = prepare_likelihood_func(
             is_population_glm=False,
-            likelihood_func=obs.log_likelihood,
+            log_likelihood_func=obs.log_likelihood,
             negative_log_likelihood_func=obs._negative_log_likelihood,
-            is_log=True,
         )
 
         # Create solver using GLM class

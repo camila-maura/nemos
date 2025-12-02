@@ -6,10 +6,16 @@ depends on both external features and a latent state that evolves over time
 according to a Markov process.
 
 Based on Venditto's script for behavioral simulation from
-https://github.com/Brody-Lab/venditto_glm-hmm/blob/main/glmhmm_example_fit.m 
+https://github.com/Brody-Lab/venditto_glm-hmm/blob/main/glmhmm_example_fit.m
 and on the behavioral variables considered in Ashwood et al. (2020).
 """
-#%%
+
+import jax
+import jax.numpy as jnp
+import matplotlib.pyplot as plt
+import numpy as np
+
+# %%
 ###
 # IMPORTS
 ###
@@ -27,7 +33,7 @@ from nemos.glm_hmm.expectation_maximization import (
     prepare_likelihood_func,
 )
 
-### 
+###
 # SESSION PARAMETERS
 ###
 
@@ -44,41 +50,52 @@ new_sess[::n_trials_per_sess] = 1            # Set 1 at the beginning of each se
 ###
 # GLM-HMM PARAMETERS
 ###
-n_states = 3                # Number of latent states
+n_states = 3  # Number of latent states
 
 # We will consider a design matrix with the
 # following behavioral variables
 # x = [bias, stimulus, last_choice, win_stay_lose_shift]
-X_labels = ["bias", "stimulus"] #, "last_choice", "win-stay-lose-shift"]
+X_labels = ["bias", "stimulus"]  # , "last_choice", "win-stay-lose-shift"]
 
-n_features = len(X_labels) # Number of features in design matrix
+n_features = len(X_labels)  # Number of features in design matrix
 
-# Projection weights, using parameters from Ashwood et al. (2020) 
+# Projection weights, using parameters from Ashwood et al. (2020)
 # results for example IBL mouse (Fig. 2)
 # NOTE: in the ssh tutorial, they only use Bias and Stimulus. Since computing previous choice and WSLS might take a bit, I will only use those two for now. It is pending to add the other two elements in the projection weights and design matrix.
-true_projection_weights = np.array([
-    [1, -3, 3],             # Bias - Intercept
-    [6, 2, 2],              # Stimulus
-    #[0, -.1, .1],          # Previous choice
-    #[0, 0, 0],             # Win stay Lose switch
-])
+true_projection_weights = np.array(
+    [
+        [1, -3, 3],  # Bias - Intercept
+        [6, 2, 2],  # Stimulus
+        # [0, -.1, .1],          # Previous choice
+        # [0, 0, 0],             # Win stay Lose switch
+    ]
+)
 
 # Initial state probabilities
 # Couldnt find exact numbers from fast check in Ashwood et al. - revise again
-true_initial_prob = jnp.array([0.95, 0.025, 0.025]) 
+true_initial_prob = jnp.array([0.95, 0.025, 0.025])
 
 # Transition matrix
 true_transition_prob = np.array(
-    [[0.98, 0.01, 0.01], 
-      [0.05, 0.92, 0.03], 
-      [0.03, 0.03, 0.94]]
+    [[0.98, 0.01, 0.01], [0.05, 0.92, 0.03], [0.03, 0.03, 0.94]]
 )
 
 ###
 # STIMULI
 ###
-stim_vals = [-1, -0.5, -0.25, -0.125, 
-             -0.0625, 0, 0.0625, 0.125, 0.25, 0.5, 1]   # STimuli shown to the "mice"
+stim_vals = [
+    -1,
+    -0.5,
+    -0.25,
+    -0.125,
+    -0.0625,
+    0,
+    0.0625,
+    0.125,
+    0.25,
+    0.5,
+    1,
+]  # STimuli shown to the "mice"
 
 # Generate random sequence of stimuli for simulation
 X = np.ones((n_timepoints, n_features-1)) # not including bias (thats why features -1)
@@ -124,8 +141,8 @@ for t in range(1, n_timepoints):
     prev_state_vec = true_latent_states[t - 1]
     transition_probs = true_transition_prob.T @ prev_state_vec
     next_state = jax.random.choice(subkey, jnp.arange(n_states), p=transition_probs)
-    #print(next_state)
-    #print(true_transition_prob)
+    # print(next_state)
+    # print(true_transition_prob)
 
     true_latent_states[t, next_state] = 1
 
@@ -148,59 +165,60 @@ print("Computing true likelihood of the data given the true parameters...")
 # UTILS
 ###
 
+
 def plot_glm_weights(
     n_features,
     n_states,
     true_projection_weights,
     learned_coef,
     learned_intercept,
-    initialization_setting
+    initialization_setting,
 ):
     ## Plot
-    fig = plt.figure(figsize=(4, 3), dpi=80, facecolor='w', edgecolor='k')
-    cols = ['#ff7f00', '#4daf4a', '#377eb8']
+    fig = plt.figure(figsize=(4, 3), dpi=80, facecolor="w", edgecolor="k")
+    cols = ["#ff7f00", "#4daf4a", "#377eb8"]
     recovered_weights = np.zeros_like(true_projection_weights)
 
     recovered_weights[:1] = learned_intercept
     recovered_weights[1:] = learned_coef
-    
+
     for k in range(n_states):
-        if k ==0:
+        if k == 0:
             plt.plot(
                 range(n_features),
-                true_projection_weights[:,k], 
-                marker='o',
-                color=cols[k], 
-                linestyle='-',
-                lw=1.5, 
-                label="generative"
+                true_projection_weights[:, k],
+                marker="o",
+                color=cols[k],
+                linestyle="-",
+                lw=1.5,
+                label="generative",
             )
             plt.plot(
-                range(n_features), 
-                recovered_weights[:,k], 
+                range(n_features),
+                recovered_weights[:, k],
                 color=cols[k],
-                lw=1.5,  
-                label = "recovered", 
-                linestyle = '--'
+                lw=1.5,
+                label="recovered",
+                linestyle="--",
             )
         else:
             plt.plot(
-                range(n_features), 
-                true_projection_weights[:,k], 
-                marker='o',
-                color=cols[k], 
-                linestyle='-',
-                lw=1.5, 
-                label=""
-            )
-            
-            plt.plot(
-                range(n_features), 
-                recovered_weights[:,k], 
+                range(n_features),
+                true_projection_weights[:, k],
+                marker="o",
                 color=cols[k],
-                lw=1.5,  
-                label = '', 
-                linestyle = '--'
+                linestyle="-",
+                lw=1.5,
+                label="",
+            )
+
+            plt.plot(
+                range(n_features),
+                recovered_weights[:, k],
+                color=cols[k],
+                lw=1.5,
+                label="",
+                linestyle="--",
             )
     plt.yticks(fontsize=10)
     plt.ylabel("GLM weight", fontsize=15)
@@ -214,15 +232,15 @@ def plot_glm_weights(
 
 
 def fit_glm_hmm_with_em(
-        X,
-        true_choices,
-        true_latent_states,
-        true_projection_weights,
-        initial_prob_initial_guess,
-        transition_prob_initial_guess,
-        projection_weights_initial_guess,
-        initialization_setting
-    ):
+    X,
+    true_choices,
+    true_latent_states,
+    true_projection_weights,
+    initial_prob_initial_guess,
+    transition_prob_initial_guess,
+    projection_weights_initial_guess,
+    initialization_setting,
+):
     is_population_glm = true_projection_weights.ndim > 2
 
 
@@ -231,12 +249,12 @@ def fit_glm_hmm_with_em(
         is_population_glm,
         observation_model.log_likelihood,
         observation_model._negative_log_likelihood,
-        is_log=True,
     )
     inverse_link_function = observation_model.default_inverse_link_function
 
     def partial_hmm_negative_log_likelihood(
-                weights, design_matrix, observations, posterior_prob):
+        weights, design_matrix, observations, posterior_prob
+    ):
         return hmm_negative_log_likelihood(
             weights,
             X=design_matrix,
@@ -271,7 +289,10 @@ def fit_glm_hmm_with_em(
         jnp.squeeze(true_choices),
         initial_prob=initial_prob_initial_guess,
         transition_prob=transition_prob_initial_guess,
-        glm_params=(projection_weights_initial_guess[1:], projection_weights_initial_guess[:1]),
+        glm_params=(
+            projection_weights_initial_guess[1:],
+            projection_weights_initial_guess[:1],
+        ),
         inverse_link_function=inverse_link_function,
         likelihood_func=likelihood_func,
         solver_run=solver_run,
@@ -290,7 +311,7 @@ def fit_glm_hmm_with_em(
         learned_initial_prob,
         learned_transition,
         (learned_coef, learned_intercept),
-        likelihood_func=likelihood_func,
+        log_likelihood_func=likelihood_func,
         inverse_link_function=observation_model.default_inverse_link_function,
     )
 
@@ -299,15 +320,15 @@ def fit_glm_hmm_with_em(
         : true_latent_states.shape[1], true_latent_states.shape[1] :
     ]
     max_corr = np.max(corr_matrix, axis=1)
-    print("\nMAX CORR", max_corr) # State recovery is quite low let's check why
-    
+    print("\nMAX CORR", max_corr)  # State recovery is quite low let's check why
+
     plot_glm_weights(
         n_features,
         n_states,
         true_projection_weights,
         learned_coef,
         learned_intercept,
-        initialization_setting
+        initialization_setting,
     )
     
     fig = plt.figure(figsize=(5, 2.5), dpi=80, facecolor='w', edgecolor='k')
@@ -369,14 +390,13 @@ print(f"Fitting data with {initialization_setting} initialization...")
 
 # add small noise to initial prob
 initial_prob_initial_guess = true_initial_prob + np.random.uniform(0, 0.01)
-initial_prob_initial_guess /= initial_prob_initial_guess.sum() # Normalize
+initial_prob_initial_guess /= initial_prob_initial_guess.sum()  # Normalize
 print("--Initial probability guess: \n", initial_prob_initial_guess)
 print("--Check it sums to 1", initial_prob_initial_guess.sum())
 
 # add small noise to projection weights
 projection_weights_initial_guess = (
-    true_projection_weights + 
-    np.random.randn(*true_projection_weights.shape) * 1e-8
+    true_projection_weights + np.random.randn(*true_projection_weights.shape) * 1e-8
 )
 print("Initial projection weights guess: \n", projection_weights_initial_guess)
 
@@ -412,7 +432,9 @@ print("--Check it sums to 1", initial_prob_initial_guess.sum())
 # Normalization is not necessary anymore since dirichlet already sums to 1
 
 # Random projection weights
-projection_weights_initial_guess = true_projection_weights + np.random.randn(*true_projection_weights.shape)
+projection_weights_initial_guess = true_projection_weights + np.random.randn(
+    *true_projection_weights.shape
+)
 print("Initial projection weights guess: \n", projection_weights_initial_guess)
 
 # Random transition matrix
@@ -436,7 +458,7 @@ print("\n Fitting complete.")
 # This is no better than starting from a slightly perturbed version of the true parameters
 def compare_likelihoods(log_likelihoods):
     print(f"Log likelihoods from different initializations: \n {log_likelihoods}")
-    return None 
+    return None
 
 ###
 # 5. COMPARE LIKELIHOODS
