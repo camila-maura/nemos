@@ -157,3 +157,6 @@ docs/stubs
 # NPZ/NPY files
 *.npz
 *.npy
+
+# IBL files
+scripts/IBL
