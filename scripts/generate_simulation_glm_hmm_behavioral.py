@@ -20,33 +20,25 @@ import numpy as np
 # IMPORTS
 ###
 import nemos as nmo
-import numpy as np
-import jax.numpy as jnp
-import jax
-import matplotlib.pyplot as plt
-import sys
-
 from nemos.glm_hmm.expectation_maximization import (
     em_glm_hmm,
     forward_backward,
     hmm_negative_log_likelihood,
     prepare_likelihood_func,
 )
-#jax.config.update("jax_enable_x64", True)
 
 ###
 # SESSION PARAMETERS
 ###
 
-seed = 0                 # Random seed for reproducibility
+seed = 123  # Random seed for reproducibility
 np.random.seed(seed)
 
-# For 100 sessions > this works fine, but 20 sessions does not yield good recovery
-n_sess = 20                 # Number of sessions to simulate
-n_trials_per_sess = 100     # Number of trials in a session
-n_timepoints = n_sess * n_trials_per_sess # Total number of timepoints
-new_sess = np.zeros(n_timepoints, dtype=int) # Indicator for session starts
-new_sess[::n_trials_per_sess] = 1            # Set 1 at the beginning of each session
+n_sess = 20  # Number of sessions to simulate
+n_trials_per_sess = 100  # Number of trials in a session
+n_timepoints = n_sess * n_trials_per_sess  # Total number of timepoints
+new_sess = np.zeros(n_timepoints, dtype=int)  # Indicator for session starts
+new_sess[::n_trials_per_sess] = 1  # Set 1 at the beginning of each session
 
 ###
 # GLM-HMM PARAMETERS
@@ -99,8 +91,8 @@ stim_vals = [
 ]  # STimuli shown to the "mice"
 
 # Generate random sequence of stimuli for simulation
-X = np.ones((n_timepoints, n_features-1)) # not including bias (thats why features -1)
-X = np.random.choice(stim_vals, n_timepoints)
+X = np.ones((n_timepoints, n_features))
+X[:, 1] = np.random.choice(stim_vals, n_timepoints)
 
 ###
 # SIMULATION
@@ -117,21 +109,21 @@ true_latent_states[0, initial_state] = 1
 
 # Initialize GLM
 glm = nmo.glm.GLM(observation_model="Bernoulli")
+glm.intercept_ = jnp.zeros((1,))
 
 # Set initial weights and simulate first timepoint
-#glm.coef_ = true_projection_weights[..., initial_state].reshape(
-#    true_projection_weights.shape[0],1)
+glm.coef_ = true_projection_weights[..., initial_state].reshape(
+    true_projection_weights.shape[0], 1
+)
 
-glm.intercept_ =  true_projection_weights[0,initial_state].reshape(1)
-glm.coef_ = true_projection_weights[1,initial_state].reshape(1)
-
+# Set key for replication
 key = jax.random.PRNGKey(seed)
 
 # Simulate first count and proba
-res_sim = glm.simulate(key,X[1].reshape(1,1))
+res_sim = glm.simulate(key, X[:1])
 
-true_choices[0] = res_sim[0][0]
-choice_probas[0] = res_sim[1][0]
+true_choices[0] = res_sim[0][0].item()
+choice_probas[0] = res_sim[1][0].item()
 
 # Simulate remaining timepoints
 print("Simulating data...")
@@ -140,7 +132,12 @@ for t in range(1, n_timepoints):
     key, subkey = jax.random.split(key)
 
     prev_state_vec = true_latent_states[t - 1]
+
+    # print(f"PREVIOUS STATE VECTOR {prev_state_vec} ")
+    # print(f"TRANSITION PROBAS {true_transition_prob}")
     transition_probs = true_transition_prob.T @ prev_state_vec
+    # print(f"TRANSITION PROBS {transition_probs}")
+
     next_state = jax.random.choice(subkey, jnp.arange(n_states), p=transition_probs)
     # print(next_state)
     # print(true_transition_prob)
@@ -148,19 +145,14 @@ for t in range(1, n_timepoints):
     true_latent_states[t, next_state] = 1
 
     # Update weights and simulate
-    glm.intercept_ =  true_projection_weights[0,next_state].reshape(1)
-    glm.coef_ = true_projection_weights[1,next_state].reshape(1)
-    
+    glm.coef_ = true_projection_weights[..., next_state]
     key, subkey = jax.random.split(key)
-
-    res = glm.simulate(subkey, X[t : t + 1].reshape(1,1))
+    res = glm.simulate(subkey, X[t : t + 1])
 
     true_choices[t] = res[0][0]
     choice_probas[t] = res[1][0]
     print(f"Simulated timepoint {t+1}/{n_timepoints}", end="\r")
 print("\nSimulation complete.")
-
-print("Computing true likelihood of the data given the true parameters...")
 
 ###
 # UTILS
@@ -244,7 +236,6 @@ def fit_glm_hmm_with_em(
 ):
     is_population_glm = true_projection_weights.ndim > 2
 
-
     observation_model = nmo.observation_models.BernoulliObservations()
     likelihood_func, negative_log_likelihood_func = prepare_likelihood_func(
         is_population_glm,
@@ -266,16 +257,14 @@ def fit_glm_hmm_with_em(
         )
 
     # use the BaseRegressor initialize_solver
-    
+    regularization = "UnRegularized"
+
+    solver_name = "ProximalGradient" if "Lasso" in regularization else "LBFGS"
     glm = nmo.glm.GLM(
-        observation_model=observation_model, 
-        regularizer="UnRegularized", 
-        solver_name="LBFGS", 
-        solver_kwargs={"tol":1e-12, "maxiter": 5000}
+        observation_model=observation_model,
+        regularizer=regularization,
+        solver_name=solver_name,
     )
-    
-    print("XXXXXX", projection_weights_initial_guess[1:])
-    
     glm.instantiate_solver(partial_hmm_negative_log_likelihood)
     solver_run = glm._solver_run
 
@@ -287,7 +276,7 @@ def fit_glm_hmm_with_em(
         (learned_coef, learned_intercept),
         final_state,
     ) = em_glm_hmm(
-        X,
+        X[:, 1:],
         jnp.squeeze(true_choices),
         initial_prob=initial_prob_initial_guess,
         transition_prob=transition_prob_initial_guess,
@@ -297,8 +286,8 @@ def fit_glm_hmm_with_em(
         ),
         inverse_link_function=inverse_link_function,
         likelihood_func=likelihood_func,
-        solver_run=solver_run,
-        tol=10**-5,
+        m_step_fn_glm_params=solver_run,
+        tol=10**-10,
     )
     (
         _,
@@ -308,7 +297,7 @@ def fit_glm_hmm_with_em(
         _,
         _,
     ) = forward_backward(
-        X,  
+        X[:, 1:],  # drop intercept
         true_choices,
         learned_initial_prob,
         learned_transition,
@@ -332,58 +321,13 @@ def fit_glm_hmm_with_em(
         learned_intercept,
         initialization_setting,
     )
-    
-    fig = plt.figure(figsize=(5, 2.5), dpi=80, facecolor='w', edgecolor='k')
-    #sess_id = 0  # session id; can choose any index between 0 and num_sess-1
-    cols = ['#ff7f00', '#4daf4a', '#377eb8']
-    print(posteriors.shape)
-    for k in range(n_states):
-        plt.plot(posteriors[0:100, k], label="Recovered", ls='--',lw=2,
-                color=cols[k])
-        plt.plot(true_latent_states[0:100, k], label="Generative", ls='-', lw=1,
-                color=cols[k])
-    plt.ylim((-0.01, 1.01))
-    plt.yticks([0, 0.5, 1], fontsize = 10)
-    plt.xlabel("trial #", fontsize = 15)
-    plt.ylabel("p(state)", fontsize = 15)
-    plt.legend()
-    plt.show()
-    
+
     return log_likelihood_em
 
 
 # Store likelihoods
 log_likelihoods = {}
 
-###
-# Import simulation -> when i import, it does NOT work. 
-###
-'''
-# Saved and imported from ssm notebook
-npzfile = np.load("scripts/ssm_input.npz")
-
-# True initial prob, literally copied
-true_initial_prob = jnp.array([0.95, 0.025, 0.025]) 
-
-# True transition prob, copied
-true_transition_prob = np.array(
-    [[0.98, 0.01, 0.01], 
-      [0.05, 0.92, 0.03], 
-      [0.03, 0.03, 0.94]]
-)
-
-# True weights
-true_projection_weights = np.array([
-    [1, -3, 3],             # Bias - Intercept
-    [6, 2, 2],              # Stimulus
-])
-
-# Simulation imported from ssm
-true_latent_states = npzfile["true_latents"]
-true_choices = npzfile["true_choices"]
-X = npzfile["inputs"]
-print(X)
-'''
 ###
 # 1. FIT SIMULATED DATA WITH A TINY DEVIATION FROM TRUE PARAMETERS
 ###
@@ -408,21 +352,20 @@ transition_prob_initial_guess[np.diag_indices(true_transition_prob.shape[1])] = 
 print("Initial transition probability guess \n", transition_prob_initial_guess)
 print("--Check it sums to 1", transition_prob_initial_guess.sum(axis=1))
 
+
 log_likelihoods[initialization_setting] = fit_glm_hmm_with_em(
-        X.reshape(n_timepoints,n_features-1),
-        true_choices,
-        true_latent_states,
-        true_projection_weights,
-        initial_prob_initial_guess,
-        transition_prob_initial_guess,
-        projection_weights_initial_guess,
-        initialization_setting
+    X,
+    true_choices,
+    true_latent_states,
+    true_projection_weights,
+    initial_prob_initial_guess,
+    transition_prob_initial_guess,
+    projection_weights_initial_guess,
+    initialization_setting,
 )
 print("\n Fitting complete.")
-
-
 ###
-# 2. FIT SIMULATED DATA WITH RANDOM INITIALIZATION
+# 2. FIT SIMULATED DATA WITH ABSOLUTELY RANDOM INITIALIZATION
 ###
 initialization_setting = "random_init"
 print(f"Fitting data with {initialization_setting} initialization...")
@@ -445,14 +388,14 @@ print("Initial transition probability guess \n", transition_prob_initial_guess)
 print("--Check it sums to 1", transition_prob_initial_guess.sum(axis=1))
 
 log_likelihoods[initialization_setting] = fit_glm_hmm_with_em(
-        X.reshape(n_timepoints,n_features-1),
-        true_choices,
-        true_latent_states,
-        true_projection_weights,
-        initial_prob_initial_guess,
-        transition_prob_initial_guess,
-        projection_weights_initial_guess,
-        initialization_setting
+    X,
+    true_choices,
+    true_latent_states,
+    true_projection_weights,
+    initial_prob_initial_guess,
+    transition_prob_initial_guess,
+    projection_weights_initial_guess,
+    initialization_setting,
 )
 print("\n Fitting complete.")
 
@@ -462,19 +405,30 @@ def compare_likelihoods(log_likelihoods):
     print(f"Log likelihoods from different initializations: \n {log_likelihoods}")
     return None
 
+
+###
+# 3. FIT SIMULATED DATA WITH "TILTED" INITIALIZATION
+# As in Iris paper
+###
+
+###
+# 4. FIT SIMULATED DATA WITH K-MEANS ALGORITHM
+
+###
 ###
 # 5. COMPARE LIKELIHOODS
 ###
 compare_likelihoods(log_likelihoods)
+# Okay absolutely random init in this case seems to work better than slightly perturbed true params, and the difference is pretty small...
+# - Maybe the simulation is too "easy"? Also the correlation with the third state is pretty low in both cases...
+# - Maybe there's a bug somewhere in the simulation?
+# - I am not getting the right likelihood? -> According to documentation, I am getting the total log likelihood of the sequence given the model parameters. Cant quite figure out what is off but for sure the likelihood result is different from the ssm implementation.
+# - I also should calculate the true log likelihood of the data given the true parameters to have a better idea of how well we are doing.
+# - Also should plot the most likely sequence of states vs. true states
 
-
-# Okay absolutely random init in this case seems to work better than slightly perturbed true params, and the difference is pretty small... Although unexpected, the difference in goodness of fit increases with sample size - better initial guesses get better results when the sample size is larger.
-# For some reason, ssm implementation seems to work better for a sample size of 20 *100, whilst here the results are awful.
-# I want to get the summed likelihood as opposed to mean - pending
-# Pending I also should calculate the true log likelihood of the data given the true parameters
 # Move to implementation of K means initialization and then come back to these issues.
 
-
+# %%
 
 # Notes for notebook
 # NOTE: add an admonition on the dirichlet distribution on the notebook
