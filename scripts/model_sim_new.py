@@ -1,3 +1,4 @@
+
 import numpy as np
 import numpy.random as npr
 import jax
@@ -7,6 +8,7 @@ import ssm
 from ssm.messages import backward_pass
 from ssm.util import find_permutation
 from ssm.hmm import hmm_normalizer
+
 
 import nemos as nmo
 from nemos.glm_hmm.expectation_maximization import (
@@ -43,6 +45,7 @@ def plot_weights_recovered(true_weights, rec_weights, package: str, n_states: in
     plt.axhline(y=0, color="k", alpha=0.5, ls="--")
     plt.legend()
     plt.title(f"Weight recovery {package}", fontsize=15)
+    plt.tight_layout()
     return fig
 
 
@@ -211,19 +214,19 @@ glm.instantiate_solver(partial_hmm_negative_log_likelihood)
             glm_params=(coef, intercept),
             inverse_link_function=obs.default_inverse_link_function,
             likelihood_func=log_likelihood_func,
-            solver_run=glm._solver_run,
+            m_step_fn_glm_params=glm._solver_run,
             is_new_session=is_new_session,
             maxiter=1000,
             tol=1e-10,
         )
 
-nemos_initial_prob = log_initial_prob
-nemos_transition_prob = log_transition_matrix
+nemos_initial_prob = np.exp(log_initial_prob)
+nemos_transition_prob = np.exp(log_transition_matrix)
 predicted_rate_given_state = compute_rate_per_state(
     X, nemos_glm_params, inverse_link_function
 )
 
-log_like_nemos_stack = np.log(log_likelihood_func(1 - y, predicted_rate_given_state))
+log_like_nemos_stack = log_likelihood_func(1 - y, predicted_rate_given_state)
 
 
 log_alphas, log_normalization = forward_pass(
