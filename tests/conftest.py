@@ -366,7 +366,7 @@ def mock_regressor_nested():
 
 
 @pytest.fixture
-def instantiate_glm_hmmmock_glm():
+def mock_glm():
     return MockGLM(std_param=2)
 
 
@@ -1155,6 +1155,117 @@ def population_negativeBinomialGLM_model_instantiation_pytree(
     return X_tree, np.random.poisson(rate), model_tree, true_params_tree, rate
 
 
+def run_simulation_glm_hmm(
+    design_matrix: jnp.ndarray, model: nmo.glm_hmm.GLMHMM, seed: int
+):
+    n_timepoints = design_matrix.shape[0]
+    if isinstance(model.initialize_glm_params, tuple):
+        coef, intercept = model.initialize_glm_params
+        if coef.ndim > 2:
+            n_neurons = coef.shape[1]
+        else:
+            n_neurons = 1
+        n_states = intercept.shape[-1]
+        initial_prob = model.initialize_init_proba
+        transition_prob = model.initialize_transition_proba
+    else:
+        raise ValueError("Must provided concrete intial values to run simulaitons.")
+
+    # Initialize GLM
+    glm = nmo.glm.PopulationGLM(
+        observation_model=model.observation_model,
+        inverse_link_function=model.inverse_link_function,
+    )
+
+    # Initialize storage
+    latent_states = np.zeros((n_timepoints, n_states), dtype=int)
+    rates = np.zeros((n_timepoints, n_neurons))
+    counts = np.zeros((n_timepoints, n_neurons))
+
+    # Sample initial state
+    np.random.seed(seed)
+    initial_state = np.random.choice(n_states, p=initial_prob)
+    latent_states[0, initial_state] = 1
+
+    # Set initial weights and simulate first timepoint
+    glm.coef_ = coef[..., initial_state].reshape(coef.shape[0], n_neurons)
+    glm.intercept_ = intercept[..., initial_state].reshape((n_neurons,))
+    glm.scale_ = 1.0
+    glm._initialize_feature_mask(design_matrix, rates)
+
+    key = jax.random.PRNGKey(seed)
+    counts[0], rates[0] = glm.simulate(key, design_matrix[:1])
+
+    # Simulate remaining timepoints
+    for t in range(1, n_timepoints):
+        # Sample next state
+        key, subkey = jax.random.split(key)
+        prev_state_vec = latent_states[t - 1]
+        transition_probs = transition_prob.T @ prev_state_vec
+        next_state = jax.random.choice(subkey, jnp.arange(n_states), p=transition_probs)
+        latent_states[t, next_state] = 1
+
+        # Update weights and simulate
+        glm.coef_ = coef[..., next_state].reshape(coef.shape[0], n_neurons)
+        glm.intercept_ = intercept[..., next_state].reshape((n_neurons,))
+        key, subkey = jax.random.split(key)
+        counts[t], rates[t] = glm.simulate(subkey, design_matrix[t : t + 1])
+
+    if isinstance(model, nmo.glm_hmm.GLMHMM):
+        counts = jnp.squeeze(counts)
+        rates = jnp.squeeze(rates)
+        counts = jnp.squeeze(counts)
+
+    return counts, rates, latent_states
+
+
+def instantiate_glm_hmm_func(
+    n_states: int = 3,
+    obs_model: (
+        Literal["Poisson", "Gamma", "Bernoulli", "NegativeBinomial"]
+        | nmo.observation_models.Observations
+    ) = "Bernoulli",
+    regularizer: str = "UnRegularized",
+    solver_name: str = None,
+    simulate=False,
+):
+    jax.config.update("jax_enable_x64", True)
+    np.random.seed(123)
+    n_neurons = 1
+    n_features = 2
+    X = np.ones((500, n_features))
+    X[:250, 0] = 0
+    X[np.arange(500) % 2 == 1, 1] = 0
+    glm_params = random_glm_params_init(
+        n_neurons, n_states, X, random_key=jax.random.PRNGKey(123)
+    )
+    glm_params = jax.numpy.squeeze(glm_params[0]), np.squeeze(glm_params[1])
+    transition_prob = sticky_transition_proba_init(n_states)
+    init_prob = uniform_initial_proba_init(n_states, random_key=jax.random.PRNGKey(124))
+
+    model = nmo.glm_hmm.GLMHMM(
+        n_states=n_states,
+        observation_model=obs_model,
+        regularizer=regularizer,
+        solver_name=solver_name,
+        initialize_transition_proba=transition_prob,
+        initialize_glm_params=glm_params,
+        initialize_init_proba=init_prob,
+    )
+    if simulate:
+        counts, rates, latent_states = run_simulation_glm_hmm(X, model, seed=1234)
+    else:
+        counts, rates, latent_states = None, None, None
+    return (
+        X,
+        counts,
+        model,
+        (glm_params, transition_prob, init_prob),
+        rates,
+        latent_states,
+    )
+
+
 def instantiate_glm_func(
     obs_model: (
         Literal["Poisson", "Gamma", "Bernoulli", "NegativeBinomial"]
@@ -1240,6 +1351,10 @@ MODEL_CONFIG = {
         "is_population": True,
         "default_y_shape": (500, 3),
     },
+    "GLMHMM": {
+        "is_population": False,
+        "default_y_shape": (500,),
+    },
 }
 
 
@@ -1274,6 +1389,8 @@ def instantiate_base_regressor_subclass(request):
             result = instantiate_population_glm_func(
                 obs_model=obs_model, simulate=simulate
             )
+        elif model_name == "GLMHMM":
+            result = instantiate_glm_hmm_func(obs_model=obs_model, simulate=simulate)
         else:
             raise ValueError("model_name {} unknown".format(model_name))
         _MODEL_CACHE[cache_key] = result

@@ -97,7 +97,7 @@ def uniform_initial_proba_init(n_states: int, random_key=jax.random.PRNGKey(124)
     --------
     >>> import jax
     >>> import jax.numpy as jnp
-    >>> from nemos.glm_hmm.parameters_initialization import uniform_initial_proba_init
+    >>> from nemos.glm_hmm.initialize_parameters import uniform_initial_proba_init
     >>>
     >>> # Generate initial probabilities for 3 states
     >>> n_states = 3
@@ -122,9 +122,28 @@ AVAILABLE_TRANSITION_PROBA_INIT = [sticky_transition_proba_init]
 AVAILABLE_INITIAL_PROBA_INIT = [uniform_initial_proba_init]
 
 INIT_FUNCTION_MAPPING = {
-    "glm_params_init": {"random_glm_params_init": random_glm_params_init},
-    "transition_proba": {"sticky_transition_proba": sticky_transition_proba_init},
-    "initial_proba": {"uniform": uniform_initial_proba_init},
+    "glm_params_init": {
+        "random_glm_params_init": random_glm_params_init,
+    },
+    "transition_proba": {
+        "sticky_transition_proba": sticky_transition_proba_init,
+    },
+    "initial_proba": {
+        "uniform": uniform_initial_proba_init,
+    },
+}
+
+# this is used by save/load, not intended to be user exposed
+INIT_FUNCTION_MAPPING_MODULE = {
+    "glm_params_init": {
+        "nemos.glm_hmm.initialize_parameters.random_glm_params_init": random_glm_params_init,
+    },
+    "transition_proba": {
+        "nemos.glm_hmm.initialize_parameters.sticky_transition_proba_init": sticky_transition_proba_init,
+    },
+    "initial_proba": {
+        "nemos.glm_hmm.initialize_parameters.uniform_initial_proba_init": uniform_initial_proba_init,
+    },
 }
 
 
@@ -173,6 +192,7 @@ def resolve_glm_params_init_function(
     --------
     >>> import jax.numpy as jnp
     >>> import jax
+    >>> jax.config.update("jax_enable_x64", True)
     >>> from nemos.glm_hmm.initialize_parameters import resolve_glm_params_init_function
     >>>
     >>> n_features, n_states = 4, 3
@@ -183,39 +203,39 @@ def resolve_glm_params_init_function(
     True
     >>>
     >>> # Use explicit weights
-    >>> weights = jnp.zeros((n_features, n_states))
-    >>> init_array = resolve_glm_params_init_function(weights)
+    >>> glm_params = (jnp.zeros((n_features, n_states)), jnp.zeros(n_states))
+    >>> init_array = resolve_glm_params_init_function(glm_params)
     >>> init_array
-    Array([[0., 0., 0.],
-       [0., 0., 0.],
-       [0., 0., 0.],
-       [0., 0., 0.]], dtype=float32)
+    (Array([[0., 0., 0.],
+           [0., 0., 0.],
+           [0., 0., 0.],
+           [0., 0., 0.]], dtype=float64), Array([0., 0., 0.], dtype=float64))
     >>>
     >>> # Use custom function with optional parameters
     >>> def custom_init(n_states, X, key, scale=1.0):
-    ...     return jax.random.normal(key, (n_states, X.shape[1])) * scale
+    ...     return jax.random.normal(key, (n_states, X.shape[1])) * scale, jax.random.normal(key, (n_states,))
     >>> init_fn = resolve_glm_params_init_function(custom_init)
     >>> callable(init_fn)
     True
     """
     # Check if it's a pre-defined function
-    if glm_params_init in AVAILABLE_GLM_PARAMS_INIT:
+    if callable(glm_params_init) and glm_params_init in AVAILABLE_GLM_PARAMS_INIT:
         return glm_params_init
 
     # Handle string names
     elif isinstance(glm_params_init, str):
         mapping = INIT_FUNCTION_MAPPING["glm_params_init"]
-        if glm_params_init not in mapping:
+        mapping_module = INIT_FUNCTION_MAPPING_MODULE["glm_params_init"]
+        if glm_params_init in mapping:
+            return mapping[glm_params_init]
+        elif glm_params_init in mapping_module:
+            return mapping_module[glm_params_init]
+        else:
             available = ", ".join(f"'{k}'" for k in mapping.keys())
             raise ValueError(
                 f"Unknown projection initialization method: '{glm_params_init}'.\n"
                 f"Available methods are: {available}"
             )
-        return mapping[glm_params_init]
-
-    # Handle array-like inputs
-    elif all(is_numpy_array_like(p)[1] for p in glm_params_init):
-        return tuple(jnp.asarray(p, dtype=float) for p in glm_params_init)
 
     # Handle callable inputs
     elif callable(glm_params_init):
@@ -245,6 +265,10 @@ def resolve_glm_params_init_function(
             )
 
         return glm_params_init
+
+    # Handle array-like inputs
+    elif all(is_numpy_array_like(p)[1] for p in glm_params_init):
+        return tuple(jnp.asarray(p, dtype=float) for p in glm_params_init)
 
     # Invalid type
     valid_strings_formatted = ", ".join(
@@ -301,6 +325,7 @@ def resolve_transition_proba_init_function(
     --------
     >>> import jax.numpy as jnp
     >>> import jax
+    >>> jax.config.update("jax_enable_x64", True)
     >>> from nemos.glm_hmm.initialize_parameters import resolve_transition_proba_init_function
     >>>
     >>> n_states = 3
@@ -313,9 +338,9 @@ def resolve_transition_proba_init_function(
     >>> trans_matrix = jnp.eye(n_states) * 0.9 + 0.1 / n_states
     >>> init_array = resolve_transition_proba_init_function(trans_matrix)
     >>> init_array
-    Array([[0.93333334, 0.03333334, 0.03333334],
-       [0.03333334, 0.93333334, 0.03333334],
-       [0.03333334, 0.03333334, 0.93333334]], dtype=float32)
+    Array([[0.93333333, 0.03333333, 0.03333333],
+           [0.03333333, 0.93333333, 0.03333333],
+           [0.03333333, 0.03333333, 0.93333333]], dtype=float64)
     >>>
     >>> # Use custom function with optional parameters
     >>> def custom_init(n_states, diagonal_weight=0.8):
@@ -325,19 +350,23 @@ def resolve_transition_proba_init_function(
     True
     """
     # Check if it's a pre-defined function
-    if transition_prob in AVAILABLE_TRANSITION_PROBA_INIT:
+    if callable(transition_prob) and transition_prob in AVAILABLE_TRANSITION_PROBA_INIT:
         return transition_prob
 
     # Handle string names
     elif isinstance(transition_prob, str):
         mapping = INIT_FUNCTION_MAPPING["transition_proba"]
-        if transition_prob not in mapping:
+        mapping_module = INIT_FUNCTION_MAPPING_MODULE["transition_proba"]
+        if transition_prob in mapping:
+            return mapping[transition_prob]
+        elif transition_prob in mapping_module:
+            return mapping_module[transition_prob]
+        else:
             available = ", ".join(f"'{k}'" for k in mapping.keys())
             raise ValueError(
                 f"Unknown transition probability initialization method: '{transition_prob}'.\n"
                 f"Available methods are: {available}"
             )
-        return mapping[transition_prob]
 
     # Handle array-like inputs
     elif is_numpy_array_like(transition_prob)[1]:
@@ -424,6 +453,7 @@ def resolve_initial_state_proba_init_function(
     Examples
     --------
     >>> import jax
+    >>> jax.config.update("jax_enable_x64", True)
     >>> import jax.numpy as jnp
     >>> from nemos.glm_hmm.initialize_parameters import resolve_initial_state_proba_init_function
     >>>
@@ -438,7 +468,7 @@ def resolve_initial_state_proba_init_function(
     >>> init_probs = jnp.array([0.5, 0.3, 0.2])
     >>> init_array = resolve_initial_state_proba_init_function(init_probs)
     >>> init_array
-    Array([0.5, 0.3, 0.2], dtype=float32)
+    Array([0.5, 0.3, 0.2], dtype=float64)
     >>>
     >>> # Use custom function with optional parameters
     >>> def custom_init(n_states, key, temperature=1.0):
@@ -449,19 +479,26 @@ def resolve_initial_state_proba_init_function(
     True
     """
     # Check if it's a pre-defined function
-    if initial_state_proba_init in AVAILABLE_INITIAL_PROBA_INIT:
+    if (
+        callable(initial_state_proba_init)
+        and initial_state_proba_init in AVAILABLE_INITIAL_PROBA_INIT
+    ):
         return initial_state_proba_init
 
     # Handle string names
     elif isinstance(initial_state_proba_init, str):
         mapping = INIT_FUNCTION_MAPPING["initial_proba"]
-        if initial_state_proba_init not in mapping:
+        mapping_module = INIT_FUNCTION_MAPPING_MODULE["initial_proba"]
+        if initial_state_proba_init in mapping:
+            return mapping[initial_state_proba_init]
+        elif initial_state_proba_init in mapping_module:
+            return mapping_module[initial_state_proba_init]
+        else:
             available = ", ".join(f"'{k}'" for k in mapping.keys())
             raise ValueError(
                 f"Unknown initial state initialization method: '{initial_state_proba_init}'.\n"
                 f"Available methods are: {available}"
             )
-        return mapping[initial_state_proba_init]
 
     # Handle array-like inputs
     elif is_numpy_array_like(initial_state_proba_init)[1]:

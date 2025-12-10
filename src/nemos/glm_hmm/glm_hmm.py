@@ -17,7 +17,7 @@ from ..glm import GLM
 from ..inverse_link_function_utils import resolve_inverse_link_function
 from ..observation_models import Observations
 from ..pytrees import FeaturePytree
-from ..regularizer import Regularizer
+from ..regularizer import GroupLasso, Lasso, Regularizer, Ridge
 from ..third_party.jaxopt import jaxopt
 from ..type_casting import (
     is_numpy_array_like,
@@ -106,7 +106,7 @@ class GLMHMM(BaseRegressor[ModelParams]):
         # check and store initialization hyperparameters.
         self.initialize_glm_params = initialize_glm_params
         self.initialize_transition_proba = initialize_transition_proba
-        self._initialize_init_proba = initialize_init_proba
+        self.initialize_init_proba = initialize_init_proba
 
         # set the prior params
         self.dirichlet_prior_alphas_init_prob = dirichlet_prior_alphas_init_prob
@@ -146,6 +146,9 @@ class GLMHMM(BaseRegressor[ModelParams]):
         self.glm_params_: Tuple[dict | jnp.ndarray, jnp.ndarray] | None = None
         self.transition_prob_: jnp.ndarray | None = None
         self.initial_prob_: jnp.ndarray | None = None
+        self.solver_state_: NamedTuple | None = None
+        self.scale_: float | None = None
+        self.dof_resid_: int | None = None
 
     @property
     def coef_(self):
@@ -154,12 +157,28 @@ class GLMHMM(BaseRegressor[ModelParams]):
             return self.glm_params_[0]
         return None
 
+    @coef_.setter
+    def coef_(self, value):
+        intercept = self.intercept_
+        if value is None and intercept is None:
+            self.glm_params_ = None
+        else:
+            self.glm_params_ = (value, intercept)
+
     @property
     def intercept_(self):
         """The GLM intercepts."""
         if self.glm_params_ is not None:
             return self.glm_params_[1]
         return None
+
+    @intercept_.setter
+    def intercept_(self, value):
+        coef = self.coef_
+        if value is None and coef is None:
+            self.glm_params_ = None
+        else:
+            self.glm_params_ = (coef, value)
 
     @property
     def maxiter(self):
@@ -332,12 +351,12 @@ class GLMHMM(BaseRegressor[ModelParams]):
 
         if not isinstance(intercept, jnp.ndarray):
             raise ValueError(
-                f"params[1] (intercept) should be a 1-dimensional array of shape ({self._n_states},). "
+                f"params[1] (GLM intercepts) must be a 1-dimensional array of shape ({self._n_states},). "
                 f"Provided params[1] is of type {type(intercept)} instead."
             )
         elif not intercept.shape == (self._n_states,):
             raise ValueError(
-                f"params[1] (intercept) should be a 1-dimensional array of shape ({self._n_states},). "
+                f"params[1] (GLM intercepts) must be a 1-dimensional array of shape ({self._n_states},). "
                 f"Provided params[1] is of shape {intercept.shape} instead."
             )
 
@@ -467,6 +486,7 @@ class GLMHMM(BaseRegressor[ModelParams]):
             self.initial_prob_,
             self.transition_prob_,
             self.glm_params_,
+            self.solver_state_,
         ) = em_glm_hmm(
             data,
             y,
@@ -480,7 +500,80 @@ class GLMHMM(BaseRegressor[ModelParams]):
             self._maxiter,
             self._tol,
         )
+        self.dof_resid_ = self._estimate_resid_degrees_of_freedom(X)
+        print(self.dof_resid_)
+        # TODO: uncomment this once the predict method is available
+        # self.scale_ = self.observation_model.estimate_scale(y, self.predict(X), self.dof_resid_)
+        self.scale_ = 1.0
         return self
+
+    def _estimate_resid_degrees_of_freedom(
+        self, X: DESIGN_INPUT_TYPE, n_samples: Optional[int] = None
+    ):
+        """
+        Estimate the degrees of freedom of the residuals.
+
+        Parameters
+        ----------
+        self :
+            A fitted GLM model.
+        X :
+            The design matrix.
+        n_samples :
+            The number of samples observed. If not provided, n_samples is set to ``X.shape[0]``. If the fit is
+            batched, the n_samples could be larger than ``X.shape[0]``.
+
+        Returns
+        -------
+        :
+            An estimate of the degrees of freedom of the residuals.
+        """
+        # Convert a pytree to a design-matrix with pytrees
+        X = jnp.hstack(jax.tree_util.tree_leaves(X))
+        dof_intercept_and_hmm = (
+            self._n_states  # intercept
+            + (
+                self._n_states - 1
+            )  # init prob (n values but sum to 1, so n-1 free values)
+            + (self._n_states - 1) * self._n_states
+        )  # transition n n-dim vectors that sum to 1
+
+        if n_samples is None:
+            n_samples = X.shape[0]
+        else:
+            if not isinstance(n_samples, int):
+                raise TypeError(
+                    "`n_samples` must either `None` or of type `int`. Type {type(n_sample)} provided "
+                    "instead!"
+                )
+
+        params = self.glm_params_
+        if params[0].ndim == 3:
+            n_neurons = params[0].shape[1]
+        else:
+            n_neurons = 1
+        # if the regularizer is lasso use the non-zero
+        # coeff as an estimate of the dof
+        # see https://arxiv.org/abs/0712.0881
+        if isinstance(self.regularizer, (GroupLasso, Lasso)):
+            resid_dof = sum(
+                tree_utils.pytree_map_and_reduce(
+                    lambda x: ~jnp.isclose(x, jnp.zeros_like(x)),
+                    lambda x: sum([jnp.sum(i, axis=0) for i in x]),
+                    params[0],
+                )
+            )
+            return n_samples - resid_dof - dof_intercept_and_hmm
+
+        elif isinstance(self.regularizer, Ridge):
+            # for Ridge, use the tot parameters (X.shape[1] + intercept)
+            return (
+                n_samples - (X.shape[1] * self.n_states) - dof_intercept_and_hmm
+            ) * jnp.ones(n_neurons)
+        else:
+            # for UnRegularized, use the rank
+            rank = jnp.linalg.matrix_rank(X)
+            return (n_samples - rank - dof_intercept_and_hmm) * jnp.ones(n_neurons)
 
     def predict(
         self,
@@ -488,6 +581,16 @@ class GLMHMM(BaseRegressor[ModelParams]):
         predict_type: Literal["most-likely", "per-state", "average"] = "most-likely",
     ) -> jnp.ndarray | nap.Tsd | nap.TsdFrame:
         """Compute predicted firing rate pet state."""
+        # output state
+        # per state
+        # (t, neu, states) pop
+        # (t, states) single neu
+        # most likely
+        # (t, neu) pop
+        # (t,) single neu
+        # average
+        # (t, neu)  pop
+        # (t,) single neu
         pass
 
     def score(
@@ -511,11 +614,11 @@ class GLMHMM(BaseRegressor[ModelParams]):
         pass
 
     def predict_proba(
-        self,  #
+        self,
         X: Union[DESIGN_INPUT_TYPE, ArrayLike],
         y: NDArray,
     ) -> jnp.ndarray | nap.TsdFrame:
-        """Compute the smoothing posteriors over states."""
+        """Compute the smoothing posteriors over-states."""
         pass
 
     def decode_state(
@@ -524,12 +627,15 @@ class GLMHMM(BaseRegressor[ModelParams]):
         """Compute the most likely states over samples."""
         pass
 
-    def _predict_and_compute_loss(
+    def compute_loss(
         self,
         params: Tuple[DESIGN_INPUT_TYPE, jnp.ndarray],
         X: DESIGN_INPUT_TYPE,
         y: jnp.ndarray,
+        *args,
+        **kwargs,
     ) -> jnp.ndarray:
+        """Loss function."""
         pass
 
     # INITIALIZATIONS
@@ -695,7 +801,7 @@ class GLMHMM(BaseRegressor[ModelParams]):
             struct2 = jax.tree_util.tree_structure(coef)
             if struct1 != struct2:
                 raise ValueError(
-                    f"X GLM coefficients must be the tree with the same structure.\n"
+                    f"X and the GLM coefficients must be PyTrees with the same structure.\n"
                     f"X has structure {struct1} and coefficients have structure {struct2}. "
                 )
 
@@ -714,11 +820,25 @@ class GLMHMM(BaseRegressor[ModelParams]):
     def save_params(
         self,
         filename: Union[str, Path],
-        fit_attrs: dict,
-        string_attrs: list = None,
     ):
         """Save model params."""
-        pass
+        # initialize saving dictionary
+        fit_attrs = self._get_fit_state()
+        # coef_ and intercept_ are redundant
+        fit_attrs.pop("coef_")
+        fit_attrs.pop("intercept_")
+        fit_attrs.pop("solver_state_")
+        string_attrs = ["inverse_link_function"]
+        putative_func = [
+            "initialize_init_proba",
+            "initialize_transition_proba",
+            "initialize_glm_params",
+        ]
+        for var_name in putative_func:
+            var = getattr(self, var_name)
+            if callable(var):
+                string_attrs.append(var_name)
+        super().save_params(filename, fit_attrs, string_attrs)
 
     # SVRG specific optimization not available.
     def _get_optimal_solver_params_config(self):
