@@ -4,7 +4,6 @@ from typing import Callable
 
 import jax.numpy as jnp
 import numpy as np
-import pynapple as nap
 import pytest
 from conftest import instantiate_base_regressor_subclass
 from test_base_regressor_subclasses import (
@@ -13,12 +12,10 @@ from test_base_regressor_subclasses import (
 )
 
 import nemos as nmo
-from nemos import tree_utils
 from nemos._observation_model_builder import (
     instantiate_observation_model,
 )
 from nemos._regularizer_builder import instantiate_regularizer
-from nemos.glm_hmm.params import GLMHMMParams, GLMParams
 from nemos.typing import FeaturePytree
 from nemos.utils import _get_name
 
@@ -37,25 +34,26 @@ DEFAULT_GLM_COEF_SHAPE = {
 
 @pytest.mark.parametrize(
     "instantiate_base_regressor_subclass",
-    INSTANTIATE_MODEL_ONLY,
+    INSTANTIATE_MODEL_AND_SIMULATE,
     indirect=True,
 )
 def test_get_fit_attrs(instantiate_base_regressor_subclass):
-    fixture = instantiate_base_regressor_subclass
+    X, y, model, params = instantiate_base_regressor_subclass[:4]
     expected_state = {
         "coef_": None,
         "dof_resid_": None,
+        "glm_params_": None,
         "initial_prob_": None,
         "intercept_": None,
         "scale_": None,
         "solver_state_": None,
         "transition_prob_": None,
     }
-    assert fixture.model._get_fit_state() == expected_state
-    fixture.model.solver_kwargs = {"maxiter": 1}
-    fixture.model.fit(fixture.X, fixture.y)
-    assert all(val is not None for val in fixture.model._get_fit_state().values())
-    assert fixture.model._get_fit_state().keys() == expected_state.keys()
+    assert model._get_fit_state() == expected_state
+    model.solver_kwargs = {"maxiter": 1}
+    model.fit(X, y)
+    assert all(val is not None for val in model._get_fit_state().values())
+    assert model._get_fit_state().keys() == expected_state.keys()
 
 
 @pytest.mark.parametrize(
@@ -70,6 +68,10 @@ class TestGLMHMM:
     observation model methods are called (e.g. error testing for input validation)
     """
 
+    # #######################
+    # # Test model.fit
+    # #######################
+
     @pytest.fixture
     def fit_weights_dimensionality_expectation(
         self, instantiate_base_regressor_subclass
@@ -77,7 +79,7 @@ class TestGLMHMM:
         """
         Fixture to define the expected behavior for test_fit_weights_dimensionality based on the type of GLM class.
         """
-        model_cls = instantiate_base_regressor_subclass.model.__class__
+        model_cls = instantiate_base_regressor_subclass[2].__class__
         if "Population" in model_cls.__name__:
             # FILL IN WHEN POPULATION CLASS IS DEFINED
             # NOTE THAT THE FIXTURE WILL MAKE TESTS FAIL FOR POPULATION, WHICH IS
@@ -87,21 +89,20 @@ class TestGLMHMM:
             return {
                 0: pytest.raises(
                     ValueError,
-                    match=r"Invalid parameter dimensionality",
+                    match=r"params\[0\] \(GLM coefficients\) must be",
                 ),
                 1: pytest.raises(
                     ValueError,
-                    match=r"Invalid parameter dimensionality",
+                    match=r"params\[0\] \(GLM coefficients\) must be",
                 ),
                 2: does_not_raise(),
                 3: pytest.raises(
                     ValueError,
-                    match=r"Invalid parameter dimensionality",
+                    match=r"params\[0\] \(GLM coefficients\) must be",
                 ),
             }
 
     @pytest.mark.parametrize("dim_weights", [0, 1, 2, 3])
-    @pytest.mark.requires_x64
     def test_fit_weights_dimensionality(
         self,
         dim_weights,
@@ -112,202 +113,123 @@ class TestGLMHMM:
         Test the `fit` method with weight matrices of different dimensionalities.
         Check for correct dimensionality.
         """
-        fixture = instantiate_base_regressor_subclass
         expectation = fit_weights_dimensionality_expectation[dim_weights]
-        n_samples, n_features = fixture.X.shape
+        X, y, model, true_params = instantiate_base_regressor_subclass[:4]
+        n_samples, n_features = X.shape
 
         if dim_weights == 0:
             init_w = jnp.array([])
         elif dim_weights == 1:
             init_w = jnp.zeros((n_features,))
         elif dim_weights == 2:
-            init_w = jnp.zeros(DEFAULT_GLM_COEF_SHAPE[fixture.model.__class__.__name__])
+            init_w = jnp.zeros(DEFAULT_GLM_COEF_SHAPE[model.__class__.__name__])
         else:
             init_w = jnp.zeros(
-                DEFAULT_GLM_COEF_SHAPE[fixture.model.__class__.__name__]
+                DEFAULT_GLM_COEF_SHAPE[model.__class__.__name__]
                 + (1,) * (dim_weights - 2)
             )
         with expectation:
-            fixture.model.fit(
-                fixture.X,
-                fixture.y,
-                init_params=(
-                    init_w,
-                    fixture.params.glm_params.intercept,
-                    jnp.exp(fixture.params.glm_scale.log_scale),
-                    jnp.exp(fixture.params.hmm_params.log_initial_prob),
-                    jnp.exp(fixture.params.hmm_params.log_transition_prob),
-                ),
-            )
+            model.fit(X, y, init_params=((init_w, true_params[0][1]), *true_params[1:]))
 
     @pytest.mark.parametrize(
         "dim_intercepts, expectation",
         [
             (
                 0,
-                pytest.raises(ValueError, match=r"Invalid parameter dimensionality"),
+                pytest.raises(
+                    ValueError, match=r"params\[1\] \(GLM intercepts\) must be"
+                ),
             ),
             (1, does_not_raise()),
             (
                 2,
-                pytest.raises(ValueError, match=r"Invalid parameter dimensionality"),
+                pytest.raises(
+                    ValueError, match=r"params\[1\] \(GLM intercepts\) must be"
+                ),
             ),
             (
                 3,
-                pytest.raises(ValueError, match=r"Invalid parameter dimensionality"),
+                pytest.raises(
+                    ValueError, match=r"params\[1\] \(GLM intercepts\) must be"
+                ),
             ),
         ],
     )
-    @pytest.mark.requires_x64
     def test_fit_intercepts_dimensionality(
         self, dim_intercepts, expectation, instantiate_base_regressor_subclass
     ):
         """
         Test the `fit` method with intercepts of different dimensionalities. Check for correct dimensionality.
         """
-        fixture = instantiate_base_regressor_subclass
+        X, y, model, true_params = instantiate_base_regressor_subclass[:4]
         if dim_intercepts == 1:
-            init_b = jnp.ones(
-                DEFAULT_GLM_COEF_SHAPE[fixture.model.__class__.__name__][1]
-            )
+            init_b = jnp.ones(DEFAULT_GLM_COEF_SHAPE[model.__class__.__name__][1])
         else:
             init_b = jnp.ones((1,) * dim_intercepts)
         with expectation:
-            fixture.model.fit(
-                fixture.X,
-                fixture.y,
-                init_params=(
-                    fixture.params.glm_params.coef,
-                    init_b,
-                    jnp.exp(fixture.params.glm_scale.log_scale),
-                    jnp.exp(fixture.params.hmm_params.log_initial_prob),
-                    jnp.exp(fixture.params.hmm_params.log_transition_prob),
-                ),
-            )
+            model.fit(X, y, init_params=((true_params[0][0], init_b), *true_params[1:]))
 
     """
     Parameterization used by test_fit_init_params_type and test_initialize_solver_init_params_type
     Contains the expected behavior and separate initial parameters for regular and population GLMs
-
-    Note: init_params is expected to be a 5-tuple (coef, intercept, scale, initial_prob, transition_prob)
     """
     fit_init_params_type_init_params = (
         "expectation, init_params_glm, init_params_population_glm",
         [
-            # Valid case: proper arrays for all 5 params
             (
                 does_not_raise(),
-                (
-                    jnp.zeros((2, 3)),
-                    jnp.zeros((3,)),
-                    jnp.ones((3,)),  # scale
-                    jnp.ones(3) / 3,
-                    jnp.ones((3, 3)) / 3,
-                ),
-                (
-                    jnp.zeros((2, 3, 3)),
+                [jnp.zeros((2, 3)), jnp.zeros((3,))],
+                [jnp.zeros((2, 3, 3)), jnp.zeros((3, 3))],
+            ),
+            (
+                pytest.raises(ValueError, match="The GLM params must be a length"),
+                [[jnp.zeros((1, 2, 3)), jnp.zeros((3,))]],
+                [[jnp.zeros((1, 2, 3)), jnp.zeros((3, 3))]],
+            ),
+            (
+                pytest.raises(KeyError),
+                dict(p1=jnp.zeros((1, 3)), p2=jnp.zeros((1, 3))),
+                dict(p1=jnp.zeros((2, 3, 3)), p2=jnp.zeros((2, 2, 3))),
+            ),
+            (
+                pytest.raises(ValueError, match=r"X and the GLM coefficients must be"),
+                [dict(p1=jnp.zeros((1, 3)), p2=jnp.zeros((1, 3))), jnp.zeros((3,))],
+                [
+                    dict(p1=jnp.zeros((1, 3, 3)), p2=jnp.zeros((1, 3, 3))),
                     jnp.zeros((3, 3)),
-                    jnp.ones((3, 3)),  # scale for population
-                    jnp.ones(3) / 3,
-                    jnp.ones((3, 3)) / 3,
-                ),
+                ],
             ),
-            # Wrong length tuple (not 5 elements)
             (
-                pytest.raises(ValueError, match="Params must have length 5"),
-                (jnp.zeros((1, 2, 3)), jnp.zeros((3,))),  # Only 2 elements
-                (jnp.zeros((1, 2, 3)), jnp.zeros((3, 3))),
-            ),
-            # Dict instead of tuple for coef (X is array, so dict coef raises error)
-            # Different observation models may raise AttributeError or TypeError
-            (
-                pytest.raises((AttributeError, TypeError)),
-                (
-                    dict(p1=jnp.zeros((1, 3)), p2=jnp.zeros((1, 3))),
-                    jnp.zeros((3,)),
-                    jnp.ones((3,)),  # scale
-                    jnp.ones(3) / 3,
-                    jnp.ones((3, 3)) / 3,
-                ),
-                (
-                    dict(p1=jnp.zeros((2, 3, 3)), p2=jnp.zeros((2, 2, 3))),
-                    jnp.zeros((3, 3)),
-                    jnp.ones((3, 3)),  # scale
-                    jnp.ones(3) / 3,
-                    jnp.ones((3, 3)) / 3,
-                ),
-            ),
-            # FeaturePytree for coef (X is array, so FeaturePytree coef raises TypeError)
-            (
-                pytest.raises(TypeError, match=r"X and coef have mismatched structure"),
-                (
+                pytest.raises(ValueError, match=r"X and the GLM coefficients must be"),
+                [
                     FeaturePytree(p1=jnp.zeros((1, 3)), p2=jnp.zeros((1, 3))),
                     jnp.zeros((3,)),
-                    jnp.ones((3,)),  # scale
-                    jnp.ones(3) / 3,
-                    jnp.ones((3, 3)) / 3,
-                ),
-                (
+                ],
+                [
                     FeaturePytree(p1=jnp.zeros((1, 3, 3)), p2=jnp.zeros((1, 2, 3))),
                     jnp.zeros((3, 3)),
-                    jnp.ones((3, 3)),  # scale
-                    jnp.ones(3) / 3,
-                    jnp.ones((3, 3)) / 3,
-                ),
+                ],
             ),
-            # Scalar instead of tuple (wrong type)
-            (pytest.raises(ValueError, match="Params must have length 5"), 0, 0),
-            # Set instead of tuple (wrong type, not subscriptable, raises ValueError about length)
+            (pytest.raises(ValueError, match="The GLM params must be a length"), 0, 0),
             (
-                pytest.raises(ValueError, match="Params must have length 5"),
+                pytest.raises(TypeError, match="Initial parameters must be array-like"),
                 {0, 1},
                 {0, 1},
             ),
-            # String as intercept (wrong type)
             (
-                pytest.raises(
-                    TypeError, match="Failed to convert parameters to JAX arrays"
-                ),
-                (
-                    jnp.zeros((2, 3)),
-                    "",
-                    jnp.ones((3,)),
-                    jnp.ones(3) / 3,
-                    jnp.ones((3, 3)) / 3,
-                ),
-                (
-                    jnp.zeros((2, 3, 3)),
-                    "",
-                    jnp.ones((3, 3)),
-                    jnp.ones(3) / 3,
-                    jnp.ones((3, 3)) / 3,
-                ),
+                pytest.raises(TypeError, match="Initial parameters must be array-like"),
+                [jnp.zeros((1, 5)), ""],
+                [jnp.zeros((1, 5)), ""],
             ),
-            # String as coef (wrong type)
             (
-                pytest.raises(
-                    TypeError, match="Failed to convert parameters to JAX arrays"
-                ),
-                (
-                    "",
-                    jnp.zeros((3,)),
-                    jnp.ones((3,)),
-                    jnp.ones(3) / 3,
-                    jnp.ones((3, 3)) / 3,
-                ),
-                (
-                    "",
-                    jnp.zeros((3, 3)),
-                    jnp.ones((3, 3)),
-                    jnp.ones(3) / 3,
-                    jnp.ones((3, 3)) / 3,
-                ),
+                pytest.raises(TypeError, match="Initial parameters must be array-like"),
+                ["", jnp.zeros((1,))],
+                ["", jnp.zeros((1,))],
             ),
         ],
     )
 
     @pytest.mark.parametrize(*fit_init_params_type_init_params)
-    @pytest.mark.requires_x64
     def test_fit_init_glm_params_type(
         self,
         instantiate_base_regressor_subclass,
@@ -319,14 +241,14 @@ class TestGLMHMM:
         Test the `fit` method with various types of initial parameters. Ensure that the provided initial parameters
         are array-like.
         """
-        fixture = instantiate_base_regressor_subclass
-        if "Population" in fixture.model.__class__.__name__:
+        X, y, model, true_params = instantiate_base_regressor_subclass[:4]
+        if "Population" in model.__class__.__name__:
             init_params = init_params_population_glm
         else:
             init_params = init_params_glm
 
         with expectation:
-            fixture.model.fit(fixture.X, fixture.y, init_params=init_params)
+            model.fit(X, y, init_params=(init_params, *true_params[1:]))
 
     @pytest.mark.parametrize(
         "delta_n_features, expectation",
@@ -336,7 +258,6 @@ class TestGLMHMM:
             (1, pytest.raises(ValueError, match="Inconsistent number of features")),
         ],
     )
-    @pytest.mark.requires_x64
     def test_fit_n_feature_consistency_weights(
         self,
         delta_n_features,
@@ -347,32 +268,22 @@ class TestGLMHMM:
         Test the `fit` method for inconsistencies between data features and initial weights provided.
         Ensure the number of features align.
         """
-        fixture = instantiate_base_regressor_subclass
-        if "Population" in fixture.model.__class__.__name__:
+        X, y, model, true_params = instantiate_base_regressor_subclass[:4]
+        if "Population" in model.__class__.__name__:
             raise RuntimeError("Fill in the test case for population glmhmm")
         else:
-            init_w = jnp.zeros((fixture.X.shape[1] + delta_n_features, 3))
+            init_w = jnp.zeros((X.shape[1] + delta_n_features, 3))
             init_b = jnp.ones(
                 3,
             )
         with expectation:
-            fixture.model.fit(
-                fixture.X,
-                fixture.y,
-                init_params=(
-                    init_w,
-                    init_b,
-                    jnp.exp(fixture.params.glm_scale.log_scale),
-                    jnp.exp(fixture.params.hmm_params.log_initial_prob),
-                    jnp.exp(fixture.params.hmm_params.log_transition_prob),
-                ),
-            )
+            model.fit(X, y, init_params=((init_w, init_b), *true_params[1:]))
 
     @pytest.fixture
     def initialize_solver_weights_dimensionality_expectation(
         self, instantiate_base_regressor_subclass
     ):
-        name = instantiate_base_regressor_subclass.model.__class__.__name__
+        name = instantiate_base_regressor_subclass[2].__class__.__name__
         if "Population" in name:
             return {
                 0: pytest.raises(
@@ -406,6 +317,7 @@ class TestGLMHMM:
                 ),
             }
 
+    #
     @pytest.mark.parametrize("dim_weights", [0, 1, 2, 3])
     def test_initialize_solver_weights_dimensionality(
         self,
@@ -417,9 +329,9 @@ class TestGLMHMM:
         Test the `initialize_solver` method with weight matrices of different dimensionalities.
         Check for correct dimensionality.
         """
-        fixture = instantiate_base_regressor_subclass
+        X, y, model, true_params = instantiate_base_regressor_subclass[:4]
         expectation = fit_weights_dimensionality_expectation[dim_weights]
-        n_samples, n_features = fixture.X.shape
+        n_samples, n_features = X.shape
 
         if dim_weights == 0:
             init_w = jnp.array([])
@@ -428,21 +340,16 @@ class TestGLMHMM:
         elif dim_weights == 2:
             init_w = jnp.zeros((n_features, 3))
         elif dim_weights == 3:
-            init_w = jnp.zeros(
-                (n_features, fixture.y.shape[1] if fixture.y.ndim > 1 else 1, 3)
-            )
+            init_w = jnp.zeros((n_features, y.shape[1] if y.ndim > 1 else 1, 3))
         else:
             init_w = jnp.zeros((n_features, 3) + (1,) * (dim_weights - 2))
         with expectation:
-            params = fixture.model.initialize_params(
-                fixture.X,
-                fixture.y,
+            params = model.initialize_params(
+                X, y, init_params=((init_w, true_params[0][1]), *true_params[1:])
             )
-            params = tuple([init_w, *params[1:]])
             # check that params are set
-            init_state = fixture.model.initialize_optimization_and_state(
-                fixture.X, fixture.y, params
-            )
+            init_state = model.initialize_state(X, y, params)
+            assert init_state.velocity == params
 
     @pytest.mark.parametrize(
         "dim_intercepts",
@@ -458,21 +365,16 @@ class TestGLMHMM:
 
         Check for correct dimensionality.
         """
-        fixture = instantiate_base_regressor_subclass
-        n_samples, n_features = fixture.X.shape
-        is_population = "Population" in fixture.model.__class__.__name__
+        X, y, model, true_params = instantiate_base_regressor_subclass[:4]
+        n_samples, n_features = X.shape
+        is_population = "Population" in model.__class__.__name__
         if (dim_intercepts == 2 and is_population) or (
             dim_intercepts == 1 and not is_population
         ):
             expectation = does_not_raise()
-        elif dim_intercepts == 0:
-            expectation = pytest.raises(
-                ValueError, match=r"Invalid parameter dimensionality"
-            )
         else:
-
             expectation = pytest.raises(
-                ValueError, match=r"Invalid parameter dimensionality"
+                ValueError, match=r"params\[1\] \(GLM intercepts\) must be"
             )
         if is_population:
             raise RuntimeError("Fill in the test case for population glmhmm")
@@ -484,15 +386,12 @@ class TestGLMHMM:
             )
             init_w = jnp.zeros((n_features, 3))
         with expectation:
-            params = fixture.model.initialize_params(
-                fixture.X,
-                fixture.y,
+            params = model.initialize_params(
+                X, y, init_params=((init_w, init_b), *true_params[1:])
             )
-            params = tuple([init_w, init_b, *params[2:]])
             # check that params are set
-            init_state = fixture.model.initialize_optimization_and_state(
-                fixture.X, fixture.y, params
-            )
+            init_state = model.initialize_state(X, y, params)
+            assert init_state.velocity == params
 
     @pytest.mark.parametrize(*fit_init_params_type_init_params)
     def test_initialize_solver_init_glm_params_type(
@@ -507,16 +406,18 @@ class TestGLMHMM:
 
         Ensure that the provided initial parameters are array-like.
         """
-        fixture = instantiate_base_regressor_subclass
-        if "Population" in fixture.model.__class__.__name__:
+        X, y, model, true_params = instantiate_base_regressor_subclass[:4]
+        if "Population" in model.__class__.__name__:
             init_params = init_params_population_glm
         else:
             init_params = init_params_glm
         with expectation:
-            # check that params are set
-            init_state = fixture.model.initialize_optimization_and_state(
-                fixture.X, fixture.y, init_params
+            params = model.initialize_params(
+                X, y, init_params=(init_params, *true_params[1:])
             )
+            # check that params are set
+            init_state = model.initialize_state(X, y, params)
+            assert init_state.velocity == params
 
     @pytest.mark.parametrize(
         "delta_n_features, expectation",
@@ -536,170 +437,138 @@ class TestGLMHMM:
         Test the `initialize_solver` method for inconsistencies between data features and initial weights provided.
         Ensure the number of features align.
         """
-        fixture = instantiate_base_regressor_subclass
-        if "Population" in fixture.model.__class__.__name__:
+        X, y, model, true_params = instantiate_base_regressor_subclass[:4]
+        if "Population" in model.__class__.__name__:
             raise RuntimeError("Fill in the test case for population glmhmm")
         else:
-            init_w = jnp.zeros((fixture.X.shape[1] + delta_n_features, 3))
+            init_w = jnp.zeros((X.shape[1] + delta_n_features, 3))
             init_b = jnp.ones(3)
         with expectation:
-            params = fixture.model.initialize_params(
-                fixture.X,
-                fixture.y,
+            params = model.initialize_params(
+                X, y, init_params=((init_w, init_b), *true_params[1:])
             )
-            params = tuple([init_w, init_b, *params[2:]])
             # check that params are set
-            init_state = fixture.model.initialize_optimization_and_state(
-                fixture.X, fixture.y, params
-            )
+            init_state = model.initialize_state(X, y, params)
+            assert init_state.velocity == params
 
-    @pytest.mark.parametrize(
-        "X, y, expectation",
-        [
-            (np.array([[np.nan], [0]]), np.array([0, 1]), does_not_raise()),
-            (np.array([[0], [np.nan]]), np.array([0, 1]), does_not_raise()),
-            (np.array([[0], [0]]), np.array([np.nan, 1]), does_not_raise()),
-            (np.array([[0], [0]]), np.array([0, np.nan]), does_not_raise()),
-            (
-                np.array([[0], [np.nan], [0]]),
-                np.array([0, 1, 2]),
-                pytest.raises(
-                    ValueError, match="GLM-HMM requires continuous time-series data"
-                ),
-            ),
-            (
-                np.array([[0], [0], [0]]),
-                np.array([0, np.nan, 2]),
-                pytest.raises(
-                    ValueError, match="GLM-HMM requires continuous time-series data"
-                ),
-            ),
-            (
-                nap.TsdFrame(
-                    t=np.arange(5),
-                    d=np.array([[0], [np.nan], [0], [0], [0]]),
-                    time_support=nap.IntervalSet([0, 3], [2, 5]),
-                ),
-                np.array([0, 1, 2, 4, 5]),
-                pytest.raises(
-                    ValueError, match="GLM-HMM requires continuous time-series data"
-                ),
-            ),
-            (
-                nap.TsdFrame(
-                    t=np.arange(5),
-                    d=np.array([[0], [0], [np.nan], [0], [0]]),
-                    time_support=nap.IntervalSet([0, 3], [2, 5]),
-                ),
-                np.array([0, 1, 2, 4, 5]),
-                does_not_raise(),
-            ),
-            (
-                np.zeros((5, 1)),
-                nap.Tsd(
-                    t=np.arange(5),
-                    d=np.array([0, np.nan, 2, 4, 5]),
-                    time_support=nap.IntervalSet([0, 3], [2, 5]),
-                ),
-                pytest.raises(
-                    ValueError, match="GLM-HMM requires continuous time-series data"
-                ),
-            ),
-            (
-                np.zeros((5, 1)),
-                nap.Tsd(
-                    t=np.arange(5),
-                    d=np.array([0, 1, np.nan, 4, 5]),
-                    time_support=nap.IntervalSet([0, 3], [2, 5]),
-                ),
-                does_not_raise(),
-            ),
-            # Multiple consecutive NaNs in middle - should fail
-            (
-                np.array([[0], [np.nan], [np.nan], [0]]),
-                np.array([0, 1, 2, 3]),
-                pytest.raises(
-                    ValueError, match="GLM-HMM requires continuous time-series data"
-                ),
-            ),
-            # Multiple consecutive NaNs at start - should pass
-            (
-                np.array([[np.nan], [np.nan], [0]]),
-                np.array([0, 1, 2]),
-                does_not_raise(),
-            ),
-            # Multiple consecutive NaNs at end - should pass
-            (
-                np.array([[0], [np.nan], [np.nan]]),
-                np.array([0, 1, 2]),
-                does_not_raise(),
-            ),
-            # All NaNs - should fail (caught by parent validation)
-            (
-                np.array([[np.nan], [np.nan]]),
-                np.array([np.nan, np.nan]),
-                pytest.raises(ValueError),
-            ),
-            # No NaNs - should pass
-            (np.array([[0], [1]]), np.array([0, 1]), does_not_raise()),
-            # NaN at start of second epoch - should pass
-            (
-                nap.TsdFrame(
-                    t=np.arange(5),
-                    d=np.array([[0], [0], [np.nan], [0], [0]]),
-                    time_support=nap.IntervalSet([0, 2], [2, 5]),
-                ),
-                np.zeros(5),
-                does_not_raise(),
-            ),
-            # Both X and y with NaNs in middle at different positions - should fail
-            (
-                np.array([[0], [np.nan], [0], [0]]),
-                np.array([0, 1, np.nan, 3]),
-                pytest.raises(
-                    ValueError, match="GLM-HMM requires continuous time-series data"
-                ),
-            ),
-            # Both X and y with NaNs in middle at same position - should fail
-            (
-                np.array([[0], [np.nan], [0]]),
-                np.array([0, np.nan, 2]),
-                pytest.raises(
-                    ValueError, match="GLM-HMM requires continuous time-series data"
-                ),
-            ),
-        ],
-    )
-    def test_nan_between_epochs(
-        self,
-        instantiate_base_regressor_subclass,
-        X,
-        y,
-        expectation,
-    ):
-        """Test that NaN values are only allowed at epoch boundaries, not in the middle.
-
-        The GLM-HMM forward-backward algorithm requires continuous time-series data within
-        each epoch. This validation ensures data quality by rejecting datasets with NaN
-        values that would break the algorithm's recurrence relations.
-
-        Test coverage:
-        - NaNs at start/end of data → allowed (epoch boundaries)
-        - NaNs in middle of epoch → rejected (breaks continuity)
-        - Multiple consecutive NaNs at borders → allowed
-        - Multiple consecutive NaNs in middle → rejected
-        - All NaN data → rejected (caught by parent validation)
-        - No NaNs → allowed (trivial case)
-        - NaNs at epoch boundaries in multi-epoch pynapple data → allowed
-        - NaNs in both X and y → properly combined and validated
-
-        This strict validation prevents runtime errors in the forward-backward algorithm
-        and ensures users provide properly formatted time-series data.
-        """
-        fixture = instantiate_base_regressor_subclass
-        model = fixture.model
-        with expectation:
-            model._validator.validate_inputs(X, y)
+    # @pytest.mark.parametrize(
+    #     "fitted_glm_type",
+    #     [
+    #         "poissonGLM_fitted_model_instantiation",
+    #         "population_poissonGLM_fitted_model_instantiation",
+    #     ],
+    # )
+    # @pytest.mark.parametrize(
+    #     "param_name, param_value, expectation",
+    #     [
+    #         # Replace observation model class name  with a string
+    #         (
+    #             "observation_model__class",
+    #             "InvalidObservations",
+    #             pytest.raises(
+    #                 ValueError, match="The class '[A-z]+' is not a native NeMoS"
+    #             ),
+    #         ),
+    #         # Full path string
+    #         (
+    #             "observation_model__class",
+    #             "nemos.observation_models.InvalidObservations",
+    #             pytest.raises(
+    #                 ValueError, match="The class '[A-z]+' is not a native NeMoS"
+    #             ),
+    #         ),
+    #         # Replace observation model class name  with an instance
+    #         (
+    #             "observation_model__class",
+    #             nmo.observation_models.GammaObservations(),
+    #             pytest.raises(
+    #                 ValueError,
+    #                 match="Object arrays cannot be loaded when allow_pickle=False",
+    #             ),
+    #         ),
+    #         # Replace observation model class name with class
+    #         (
+    #             "observation_model__class",
+    #             nmo.observation_models.GammaObservations,
+    #             pytest.raises(
+    #                 ValueError,
+    #                 match="Object arrays cannot be loaded when allow_pickle=False",
+    #             ),
+    #         ),
+    #         # Replace link function with another callable
+    #         (
+    #             "observation_model__params__inverse_link_function",
+    #             np.exp,
+    #             pytest.raises(
+    #                 ValueError,
+    #                 match="Object arrays cannot be loaded when allow_pickle=False",
+    #             ),
+    #         ),
+    #         # Unexpected dtype for class name
+    #         (
+    #             "regularizer__class",
+    #             1,
+    #             pytest.raises(
+    #                 ValueError, match="Parameter ``regularizer`` cannot be initialized"
+    #             ),
+    #         ),
+    #         # Invalid fit parameter
+    #         (
+    #             "scales_",  # wrong name for the params
+    #             1,
+    #             pytest.raises(ValueError, match="Unrecognized attribute 'scales_'"),
+    #         ),
+    #     ],
+    # )
+    # def test_modified_saved_file_raises(
+    #     self,
+    #     param_name,
+    #     param_value,
+    #     expectation,
+    #     glm_class_type,
+    #     fitted_glm_type,
+    #     request,
+    #     tmp_path,
+    # ):
+    #     _, _, fitted_model, _, _ = request.getfixturevalue(fitted_glm_type)
+    #     save_path = tmp_path / "test_model.npz"
+    #     fitted_model.save_params(save_path)
+    #     # load and edit
+    #     data = np.load(save_path, allow_pickle=True)
+    #     load_data = dict((k, v) for k, v in data.items())
+    #     load_data[param_name] = param_value
+    #     np.savez(save_path, **load_data, allow_pickle=True)
+    #
+    #     with expectation:
+    #         nmo.load_model(save_path)
+    #
+    # @pytest.mark.parametrize(
+    #     "fitted_glm_type",
+    #     [
+    #         "poissonGLM_fitted_model_instantiation",
+    #         "population_poissonGLM_fitted_model_instantiation",
+    #     ],
+    # )
+    # def test_key_suggestions(self, fitted_glm_type, request, glm_class_type, tmp_path):
+    #     _, _, fitted_model, _, _ = request.getfixturevalue(fitted_glm_type)
+    #     save_path = tmp_path / "test_model.npz"
+    #     fitted_model.save_params(save_path)
+    #
+    #     invalid_mapping = {
+    #         "regulsriaer": nmo.regularizer.Ridge,
+    #         "observatino_mdels": nmo.observation_models.GammaObservations,
+    #         "inv_link_function": jax.numpy.exp,
+    #         "total_nonsense": jax.numpy.exp,
+    #     }
+    #     match = (
+    #         r"The following keys in your mapping do not match any parameters in the loaded model:\n\n"
+    #         r"\t- 'regulsriaer', did you mean 'regularizer'\?\n"
+    #         r"\t- 'observatino_mdels', did you mean 'observation_model'\?\n"
+    #         r"\t- 'inv_link_function', did you mean 'inverse_link_function'\?\n"
+    #         r"\t- 'total_nonsense'\n"
+    #     )
+    #     with pytest.raises(ValueError, match=match):
+    #         nmo.load_model(save_path, mapping_dict=invalid_mapping)
 
 
 @pytest.mark.parametrize(
@@ -731,9 +600,10 @@ class TestGLMHMM:
         (
             nmo.glm_hmm.GLMHMM,
             {
+                "glm_params_": (jnp.zeros((2, 3)), jnp.array([1.0, 1.0, 1.0])),
                 "coef_": jnp.zeros((2, 3)),
                 "intercept_": jnp.array([1.0, 1.0, 1.0]),
-                "scale_": 2.0 * jnp.ones(3),
+                "scale_": 2.0,
                 "solver_state_": None,
                 "transition_prob_": None,
                 "initial_prob_": None,
@@ -843,6 +713,7 @@ def test_save_and_load(
                 "dof_resid_": None,
                 "solver_state_": None,
                 "transition_prob_": None,
+                "glm_params_": (jnp.zeros((2, 3)), jnp.array([1.0, 1.0, 1.0])),
                 "initial_prob_": None,
             },
         ),
@@ -1071,22 +942,19 @@ def test_save_and_load_fitted_model(instantiate_base_regressor_subclass, tmp_pat
     Test saving and loading a fitted model with various observation models and regularizers.
     Ensure all parameters are preserved.
     """
-    fixture = instantiate_base_regressor_subclass
-    fixture.model.coef_ = fixture.params.glm_params.coef
-    fixture.model.intercept_ = fixture.params.glm_params.intercept
-    fixture.model.transition_prob_ = jnp.exp(
-        fixture.params.hmm_params.log_transition_prob
-    )
-    fixture.model.initial_prob_ = jnp.exp(fixture.params.hmm_params.log_initial_prob)
-    fixture.model.scale_ = jnp.zeros_like(fixture.params.glm_params.intercept) * 11.0
-    fixture.model.dof_resid_ = 1.0
-    initial_params = fixture.model.get_params()
-    fit_state = fixture.model._get_fit_state()
+    fitted_model, true_params = instantiate_base_regressor_subclass[2:4]
+    fitted_model.glm_params_ = true_params[0]
+    fitted_model.transition_prob_ = true_params[1]
+    fitted_model.initial_prob_ = true_params[2]
+    fitted_model.scale_ = 11.0
+    fitted_model.dof_resid_ = 1.0
+    initial_params = fitted_model.get_params()
+    fit_state = fitted_model._get_fit_state()
     initial_params.update(fit_state)
 
     # Save
     save_path = tmp_path / "test_model.npz"
-    fixture.model.save_params(save_path)
+    fitted_model.save_params(save_path)
 
     # Load
     loaded_model = nmo.load_model(save_path)
@@ -1104,674 +972,3 @@ def test_save_and_load_fitted_model(instantiate_base_regressor_subclass, tmp_pat
             assert np.allclose(initial_params[k], v), msg
         else:
             assert all(np.allclose(a, b) for a, b in zip(initial_params[k], v)), msg
-
-
-@pytest.mark.parametrize(
-    "X, y, expected_new_session",
-    [
-        (np.ones((3, 1)), np.ones((3,)), jnp.array([1, 0, 0])),
-        (np.ones((3, 1)), np.array([0, np.nan, 0]), jnp.array([1, 0, 1])),
-        (
-            nap.TsdFrame(
-                t=np.arange(3),
-                d=np.zeros((3, 3)),
-            ),
-            nap.Tsd(
-                t=np.arange(3),
-                d=np.zeros((3,)),
-            ),
-            jnp.array([1, 0, 0]),
-        ),
-        (
-            nap.TsdFrame(
-                t=np.arange(3),
-                d=np.zeros((3, 3)),
-                time_support=nap.IntervalSet([0, 1.5], [1.0, 2.0]),
-            ),
-            nap.Tsd(
-                t=np.arange(3),
-                d=np.zeros((3,)),
-                time_support=nap.IntervalSet([0, 1.5], [1.0, 2.0]),
-            ),
-            jnp.array([1, 0, 1]),
-        ),
-        (
-            nap.TsdFrame(
-                t=np.arange(5),
-                d=np.zeros((5, 3)),
-                time_support=nap.IntervalSet([0, 1.5], [1.0, 5.0]),
-            ),
-            nap.Tsd(
-                t=np.arange(5),
-                d=np.array([0, 0, np.nan, np.nan, 0]),
-                time_support=nap.IntervalSet([0, 1.5], [1.0, 5.0]),
-            ),
-            jnp.array([1, 0, 1, 1, 1]),
-        ),
-        (
-            nap.TsdFrame(
-                t=np.arange(6),
-                d=np.zeros((6, 3)),
-                time_support=nap.IntervalSet([0, 1.5], [1.0, 5.0]),
-            ),
-            nap.Tsd(
-                t=np.arange(6),
-                d=np.array([0, 0, np.nan, np.nan, 0, 0]),
-                time_support=nap.IntervalSet([0, 1.5], [1.0, 5.0]),
-            ),
-            jnp.array([1, 0, 1, 1, 1, 0]),
-        ),
-        (
-            nap.TsdFrame(
-                t=np.arange(6),
-                d=np.array([[0], [0], [np.nan], [np.nan], [0], [0]]),
-                time_support=nap.IntervalSet([0, 1.5], [1.0, 5.0]),
-            ),
-            nap.Tsd(
-                t=np.arange(6),
-                d=np.zeros(6),
-                time_support=nap.IntervalSet([0, 1.5], [1.0, 5.0]),
-            ),
-            jnp.array([1, 0, 1, 1, 1, 0]),
-        ),
-        # NaN at the very end of data
-        (
-            np.ones((4, 1)),
-            np.array([0, 1, 2, np.nan]),
-            jnp.array([1, 0, 0, 0]),
-        ),
-        # X and y both have NaNs at different positions
-        (
-            np.array([[0], [np.nan], [2], [3], [np.nan]]),
-            np.array([0, 1, np.nan, 3, 4]),
-            jnp.array([1, 0, 1, 1, 0]),
-        ),
-        # X and y both have NaNs at same position
-        (
-            np.array([[0], [np.nan], [2], [3]]),
-            np.array([0, np.nan, 2, 3]),
-            jnp.array([1, 0, 1, 0]),
-        ),
-        # Entire epoch is NaN (with pynapple)
-        (
-            nap.TsdFrame(
-                t=np.arange(6),
-                d=np.zeros((6, 1)),
-                time_support=nap.IntervalSet([0, 2, 4], [1, 3, 5]),
-            ),
-            nap.Tsd(
-                t=np.arange(6),
-                d=np.array([0, 0, np.nan, np.nan, 3, 4]),
-                time_support=nap.IntervalSet([0, 2, 4], [1, 3, 5]),
-            ),
-            jnp.array([1, 0, 1, 1, 1, 0]),
-        ),
-        # Multiple NaNs at the end
-        (
-            np.ones((5, 1)),
-            np.array([0, 1, 2, np.nan, np.nan]),
-            jnp.array([1, 0, 0, 0, 1]),
-        ),
-    ],
-)
-@pytest.mark.parametrize(
-    "instantiate_base_regressor_subclass",
-    [{"model": "GLMHMM", "obs_model": "Poisson", "simulate": False}],
-    indirect=True,
-)
-def test__get_is_new_session(
-    X, y, expected_new_session, instantiate_base_regressor_subclass
-):
-    """Test that session boundaries are correctly identified from epoch starts and NaN positions.
-
-    The GLM-HMM requires proper session segmentation to reset hidden states at discontinuities.
-    This test verifies that:
-    1. Epoch start times (from pynapple time_support) are marked as new sessions
-    2. Positions immediately following NaN values are marked as new sessions
-    3. Combined NaNs from both X and y are handled correctly
-
-    This ensures the forward-backward algorithm can properly handle gaps in time-series data
-    without incorrectly propagating state information across discontinuities.
-    """
-    fixture = instantiate_base_regressor_subclass
-    model = fixture.model
-    is_new_session = model._get_is_new_session(X, y)
-    assert jnp.all(is_new_session == expected_new_session)
-
-
-@pytest.mark.parametrize(
-    "X, y",
-    [
-        (
-            nap.TsdFrame(
-                t=np.arange(6),
-                d=np.zeros((6, 1)),
-                time_support=nap.IntervalSet([0, 1.5], [1.0, 5.0]),
-            ),
-            nap.Tsd(
-                t=np.arange(6),
-                d=np.arange(6),
-                time_support=nap.IntervalSet([0, 1.5], [1.0, 5.0]),
-            ),
-        ),
-        (
-            nap.TsdFrame(
-                t=np.arange(6),
-                d=np.zeros((6, 1)),
-                time_support=nap.IntervalSet([0, 1.5], [1.0, 5.0]),
-            ),
-            nap.Tsd(
-                t=np.arange(6),
-                d=np.array([0, 1, np.nan, np.nan, 2, 3]),
-                time_support=nap.IntervalSet([0, 1.5], [1.0, 5.0]),
-            ),
-        ),
-    ],
-)
-@pytest.mark.parametrize(
-    "instantiate_base_regressor_subclass",
-    [{"model": "GLMHMM", "obs_model": "Poisson", "simulate": False}],
-    indirect=True,
-)
-def test__get_is_new_session_and_drop_nan(X, y, instantiate_base_regressor_subclass):
-    """Test that session markers remain valid after NaN removal.
-
-    Critical integration test verifying that the NaN handling pipeline preserves session
-    boundaries correctly. When NaNs are dropped from the data, the new_session indicators
-    must still point to the correct first valid sample of each epoch.
-
-    This test ensures:
-    1. Number of sessions equals number of epochs after NaN removal
-    2. Session markers correctly identify the first valid value of each epoch
-
-    This is essential because the model marks positions *after* NaNs as new sessions
-    before dropping them, ensuring session boundaries survive the filtering step.
-    """
-    fixture = instantiate_base_regressor_subclass
-    model = fixture.model
-    is_new_session = model._get_is_new_session(X, y)
-
-    _, drop_y, is_new_session = tree_utils.drop_nans(X.d, y.d, is_new_session)
-    assert is_new_session.sum() == len(X.time_support)
-    first_valid_per_epoch = []
-    for ep in y.time_support:
-        yep = np.asarray(y.get(ep.start[0], ep.end[0]))
-        Xep = np.asarray(X.get(ep.start[0], ep.end[0])).reshape(yep.shape[0], -1)
-        is_nan = np.isnan(yep) | np.any(np.isnan(Xep), axis=1)
-        first_valid_per_epoch.append(yep[~is_nan][0])
-    assert np.all(
-        np.array(first_valid_per_epoch) == drop_y[is_new_session.astype(bool)]
-    )
-
-
-# ============================================================================
-# Tests for smooth_proba method
-# ============================================================================
-
-
-@pytest.mark.parametrize(
-    "instantiate_base_regressor_subclass",
-    [
-        {"model": "GLMHMM", "obs_model": "Bernoulli", "simulate": True},
-        {"model": "GLMHMM", "obs_model": "Poisson", "simulate": True},
-        {"model": "GLMHMM", "obs_model": "Gamma", "simulate": True},
-        {"model": "GLMHMM", "obs_model": "Gaussian", "simulate": True},
-    ],
-    indirect=True,
-)
-@pytest.mark.requires_x64
-class TestInferenceMethods:
-    """Test suite for inference methods (smooth_proba, filter_proba, decode_state)."""
-
-    @staticmethod
-    def _get_expected_shape(method_name, kwargs, n_samples, n_states):
-        """Helper to compute expected output shape based on method and kwargs."""
-        if method_name in ["smooth_proba", "filter_proba"]:
-            return (n_samples, n_states)
-        elif method_name == "decode_state":
-            if kwargs.get("output_format") == "index":
-                return (n_samples,)
-            else:  # one-hot (default)
-                return (n_samples, n_states)
-        else:
-            raise ValueError(f"Unknown method: {method_name}")
-
-    @pytest.mark.parametrize(
-        "drop_attr",
-        ["coef_", "intercept_", "scale_", "initial_prob_", "transition_prob_"],
-    )
-    @pytest.mark.parametrize(
-        "method_config",
-        [
-            pytest.param(("smooth_proba", {}), id="smooth_proba"),
-            pytest.param(("filter_proba", {}), id="filter_proba"),
-            pytest.param(("decode_state", {}), id="decode_state-onehot"),
-            pytest.param(("decode_state", {"output_format": "index"}), id="decode_state-index"),
-        ],
-    )
-    def test_not_fitted_raises_error(
-        self, instantiate_base_regressor_subclass, drop_attr, method_config
-    ):
-        """Test that inference methods raise an error when model is not fitted."""
-        method_name, kwargs = method_config
-        fixture = instantiate_base_regressor_subclass
-        model = fixture.model
-        setattr(model, drop_attr, None)
-        with pytest.raises(
-            ValueError,
-            match=rf"This GLMHMM instance is not fitted yet. .+ \['{drop_attr}'\]",
-        ):
-            getattr(model, method_name)(fixture.X, fixture.y, **kwargs)
-
-    @pytest.mark.parametrize(
-        "method_config",
-        [
-            pytest.param(("smooth_proba", {}), id="smooth_proba"),
-            pytest.param(("filter_proba", {}), id="filter_proba"),
-            pytest.param(("decode_state", {}), id="decode_state-onehot"),
-            pytest.param(("decode_state", {"output_format": "index"}), id="decode_state-index"),
-        ],
-    )
-    def test_returns_correct_shape(
-        self, instantiate_base_regressor_subclass, method_config
-    ):
-        """Test that inference methods return arrays with correct shapes."""
-        method_name, kwargs = method_config
-        fixture = instantiate_base_regressor_subclass
-        model = fixture.model
-
-        # Get output
-        out = getattr(model, method_name)(fixture.X, fixture.y, **kwargs)
-
-        # Check shape
-        n_samples = (
-            ~np.isnan(np.sum(fixture.y, axis=tuple(range(1, fixture.y.ndim))))
-        ).sum()
-        n_states = model.n_states
-        expected_shape = self._get_expected_shape(method_name, kwargs, n_samples, n_states)
-        assert out.shape == expected_shape, f"Expected shape {expected_shape}, got {out.shape}"
-
-    @pytest.mark.parametrize("method_name", ["smooth_proba", "filter_proba"])
-    def test_posterior_proba_returns_valid_probabilities(
-        self, instantiate_base_regressor_subclass, method_name
-    ):
-        """Test that smooth_proba returns valid probabilities (between 0 and 1)."""
-        fixture = instantiate_base_regressor_subclass
-        model = fixture.model
-
-        # Get posteriors
-        posteriors = getattr(model, method_name)(fixture.X, fixture.y)
-
-        # Check all values are between 0 and 1
-        assert jnp.all(posteriors >= 0), "Some posteriors are negative"
-        assert jnp.all(posteriors <= 1), "Some posteriors are greater than 1"
-
-    @pytest.mark.parametrize("method_name", ["smooth_proba", "filter_proba"])
-    def test_posterior_proba_probabilities_sum_to_one(
-        self, instantiate_base_regressor_subclass, method_name
-    ):
-        """Test that probabilities sum to 1 across states for each sample."""
-        fixture = instantiate_base_regressor_subclass
-        model = fixture.model
-
-        # Get posteriors
-        posteriors = getattr(model, method_name)(fixture.X, fixture.y)
-
-        # Check sum across states
-        row_sums = jnp.sum(posteriors, axis=1)
-        assert jnp.allclose(
-            row_sums, 1.0, rtol=1e-5
-        ), f"Probabilities don't sum to 1. Min: {row_sums.min()}, Max: {row_sums.max()}"
-
-    @pytest.mark.parametrize(
-        "method_config",
-        [
-            pytest.param(("smooth_proba", {}), id="smooth_proba"),
-            pytest.param(("filter_proba", {}), id="filter_proba"),
-            pytest.param(("decode_state", {}), id="decode_state-onehot"),
-            pytest.param(("decode_state", {"output_format": "index"}), id="decode_state-index"),
-        ],
-    )
-    def test_with_arrays(self, instantiate_base_regressor_subclass, method_config):
-        """Test inference methods with numpy/jax arrays return jax array."""
-        method_name, kwargs = method_config
-        fixture = instantiate_base_regressor_subclass
-        model = fixture.model
-
-        # Test with numpy array
-        out = getattr(model, method_name)(fixture.X, fixture.y, **kwargs)
-        assert isinstance(out, jnp.ndarray), f"Expected jnp.ndarray, got {type(out)}"
-
-    @pytest.mark.parametrize("input_type", ["X", "y", "both"])
-    @pytest.mark.parametrize(
-        "method_config",
-        [
-            pytest.param(("smooth_proba", {}), id="smooth_proba"),
-            pytest.param(("filter_proba", {}), id="filter_proba"),
-            pytest.param(("decode_state", {}), id="decode_state-onehot"),
-            pytest.param(("decode_state", {"output_format": "index"}), id="decode_state-index"),
-        ],
-    )
-    def test_with_pynapple_returns_tsdframe(
-        self, instantiate_base_regressor_subclass, input_type, method_config
-    ):
-        """Test that inference methods return TsdFrame/Tsd when input is pynapple."""
-        method_name, kwargs = method_config
-        fixture = instantiate_base_regressor_subclass
-        model = fixture.model
-
-        # Convert to pynapple
-        n_samples = fixture.X.shape[0]
-        time = np.linspace(0, n_samples / 100, n_samples)
-
-        X_input = fixture.X
-        y_input = fixture.y
-
-        if input_type in ["X", "both"]:
-            X_input = nap.TsdFrame(t=time, d=fixture.X)
-        if input_type in ["y", "both"]:
-            y_input = nap.Tsd(t=time, d=fixture.y)
-
-        # Get output
-        out = getattr(model, method_name)(X_input, y_input, **kwargs)
-
-        # Check return type - decode_state with index format returns Tsd, others return TsdFrame
-        if method_name == "decode_state" and kwargs.get("output_format") == "index":
-            assert isinstance(out, nap.Tsd), f"Expected nap.Tsd, got {type(out)}"
-            assert out.shape == (n_samples,)
-        else:
-            assert isinstance(out, nap.TsdFrame), f"Expected nap.TsdFrame, got {type(out)}"
-            assert out.shape == (n_samples, model.n_states)
-        assert jnp.allclose(out.t, time)
-
-    @pytest.mark.parametrize(
-        "method_config",
-        [
-            pytest.param(("smooth_proba", {}), id="smooth_proba"),
-            pytest.param(("filter_proba", {}), id="filter_proba"),
-            pytest.param(("decode_state", {}), id="decode_state-onehot"),
-            pytest.param(("decode_state", {"output_format": "index"}), id="decode_state-index"),
-        ],
-    )
-    def test_with_multiple_sessions(
-        self, instantiate_base_regressor_subclass, method_config
-    ):
-        """Test inference methods with multiple sessions (pynapple epochs)."""
-        method_name, kwargs = method_config
-        fixture = instantiate_base_regressor_subclass
-        model = fixture.model
-
-        # Create multi-session data
-        n_samples = fixture.X.shape[0]
-        session_1_end = n_samples // 2
-
-        time = np.linspace(0, n_samples / 100, n_samples)
-        epochs = nap.IntervalSet(
-            start=[time[0], time[session_1_end]],
-            end=[time[session_1_end - 1], time[-1]],
-        )
-
-        X_tsd = nap.TsdFrame(t=time, d=fixture.X, time_support=epochs)
-        y_tsd = nap.Tsd(t=time, d=fixture.y, time_support=epochs)
-
-        # Get output
-        out = getattr(model, method_name)(X_tsd, y_tsd, **kwargs)
-
-        # Check shape and type
-        if method_name == "decode_state" and kwargs.get("output_format") == "index":
-            assert isinstance(out, nap.Tsd)
-            assert out.shape == (n_samples,)
-        else:
-            assert isinstance(out, nap.TsdFrame)
-            assert out.shape == (n_samples, model.n_states)
-
-        # Check probabilities are valid for proba methods
-        if method_name in ["smooth_proba", "filter_proba"]:
-            assert jnp.all(out.values >= 0)
-            assert jnp.all(out.values <= 1)
-            row_sums = jnp.sum(out.values, axis=1)
-            assert jnp.allclose(row_sums, 1.0, rtol=1e-5)
-
-    @pytest.mark.parametrize(
-        "method_config",
-        [
-            pytest.param(("smooth_proba", {}), id="smooth_proba"),
-            pytest.param(("filter_proba", {}), id="filter_proba"),
-            pytest.param(("decode_state", {}), id="decode_state-onehot"),
-            pytest.param(("decode_state", {"output_format": "index"}), id="decode_state-index"),
-        ],
-    )
-    def test_consistency_across_calls(
-        self, instantiate_base_regressor_subclass, method_config
-    ):
-        """Test that inference methods return consistent results across multiple calls."""
-        method_name, kwargs = method_config
-        fixture = instantiate_base_regressor_subclass
-        model = fixture.model
-
-        # Get output twice
-        out_1 = getattr(model, method_name)(fixture.X, fixture.y, **kwargs)
-        out_2 = getattr(model, method_name)(fixture.X, fixture.y, **kwargs)
-
-        # Check consistency
-        assert jnp.allclose(
-            out_1, out_2
-        ), f"{method_name} returns different results on consecutive calls"
-
-    @pytest.mark.parametrize(
-        "method_name", ["smooth_proba", "filter_proba", "decode_state"]
-    )
-    def test_single_sample(self, instantiate_base_regressor_subclass, method_name):
-        """Test smooth_proba with a single sample."""
-        fixture = instantiate_base_regressor_subclass
-        model = fixture.model
-
-        # Get posteriors for single sample
-        X_single = fixture.X[:1]
-        y_single = fixture.y[:1]
-        out = getattr(model, method_name)(X_single, y_single)
-
-        # Check shape
-        assert out.shape == (1, model.n_states)
-
-        if method_name != "decode_state":
-            # Check probabilities are valid
-            assert jnp.all(out >= 0)
-            assert jnp.all(out <= 1)
-            assert jnp.allclose(jnp.sum(out), 1.0, rtol=1e-5)
-
-    @pytest.mark.parametrize(
-        "method_name", ["smooth_proba", "filter_proba", "decode_state"]
-    )
-    def test_with_nans_filtered(self, instantiate_base_regressor_subclass, method_name):
-        """Test that smooth_proba handles NaNs properly by filtering them."""
-        fixture = instantiate_base_regressor_subclass
-        model = fixture.model
-
-        # Create data with NaNs
-        X_with_nan = fixture.X.copy()
-        y_with_nan = fixture.y.copy()
-
-        # Add NaNs at specific indices
-        nan_indices = [0, 1, 2]
-        X_with_nan[nan_indices] = np.nan
-
-        # This should work - NaNs get filtered internally
-        posteriors = getattr(model, method_name)(X_with_nan, y_with_nan)
-
-        # Check that we get valid output (NaN rows filtered)
-        assert posteriors.shape[1] == model.n_states
-        # After filtering NaNs, shape[0] should be reduced
-        assert posteriors.shape[0] == fixture.X.shape[0]
-
-    @pytest.mark.parametrize(
-        "method_name", ["smooth_proba", "filter_proba", "decode_state"]
-    )
-    def test_different_observation_models(
-        self, instantiate_base_regressor_subclass, method_name
-    ):
-        """Test smooth_proba works with different observation models."""
-        fixture = instantiate_base_regressor_subclass
-        model = fixture.model
-        obs_model_name = model.observation_model.__class__.__name__
-
-        # Get posteriors
-        out = getattr(model, method_name)(fixture.X, fixture.y)
-
-        # Basic checks
-        assert out.shape == (
-            fixture.X.shape[0],
-            model.n_states,
-        ), f"Shape check failed for {obs_model_name}"
-
-        if method_name != "decode_state":
-            assert jnp.all(out >= 0), f"Negative probabilities for {obs_model_name}"
-            assert jnp.all(out <= 1), f"Probabilities > 1 for {obs_model_name}"
-            row_sums = jnp.sum(out, axis=1)
-            assert jnp.allclose(
-                row_sums, 1.0, rtol=1e-5
-            ), f"Probabilities don't sum to 1 for {obs_model_name}"
-
-    @pytest.mark.parametrize("method_name", ["smooth_proba", "filter_proba"])
-    def test_posterior_proba_maxiter_effect(
-        self, instantiate_base_regressor_subclass, method_name
-    ):
-        """Test that smooth_proba results depend on model fit quality (maxiter)."""
-        fixture = instantiate_base_regressor_subclass
-
-        # Fit with very few iterations
-        model_poor = nmo.glm_hmm.GLMHMM(
-            n_states=fixture.model.n_states,
-            observation_model=fixture.model.observation_model,
-            solver_kwargs={"maxiter": 1},
-        )
-        model_poor.fit(fixture.X, fixture.y)
-        posteriors_poor = model_poor.smooth_proba(fixture.X, fixture.y)
-
-        # Fit with more iterations
-        model_better = nmo.glm_hmm.GLMHMM(
-            n_states=fixture.model.n_states,
-            observation_model=fixture.model.observation_model,
-            solver_kwargs={"maxiter": 10},
-        )
-        model_better.fit(fixture.X, fixture.y)
-        posteriors_better = model_better.smooth_proba(fixture.X, fixture.y)
-
-        # Both should be valid probabilities
-        for posteriors in [posteriors_poor, posteriors_better]:
-            assert jnp.all(posteriors >= 0)
-            assert jnp.all(posteriors <= 1)
-            row_sums = jnp.sum(posteriors, axis=1)
-            assert jnp.allclose(row_sums, 1.0, rtol=1e-5)
-
-    @pytest.mark.parametrize(
-        "method_name", ["smooth_proba", "filter_proba", "decode_state"]
-    )
-    @pytest.mark.parametrize("nan_location", [[], [0, 1, 10, 11, 12]])
-    def test_pynapple_in_pynapple_out_X(
-        self, instantiate_base_regressor_subclass, method_name, nan_location
-    ):
-        fixture = instantiate_base_regressor_subclass
-        X = fixture.X.copy()
-        X[nan_location] = np.nan
-        ep = nap.IntervalSet([0, 10], [9, 500])
-        X = nap.TsdFrame(t=np.arange(X.shape[0]), d=X, time_support=ep)
-        y = fixture.y
-        model = fixture.model
-        out = getattr(model, method_name)(X, y)
-        assert isinstance(out, nap.TsdFrame), f"Did not return pynapple!"
-        assert np.all(
-            np.isnan(out[nan_location])
-        ), f"Not returning NaNs in the expected location!"
-
-    @pytest.mark.parametrize(
-        "method_name", ["smooth_proba", "filter_proba", "decode_state"]
-    )
-    @pytest.mark.parametrize("nan_location", [[], [0, 1, 10, 11, 12]])
-    def test_pynapple_in_pynapple_out_y(
-        self, instantiate_base_regressor_subclass, method_name, nan_location
-    ):
-        fixture = instantiate_base_regressor_subclass
-        X = fixture.X
-        y = np.array(fixture.y.copy(), dtype=float)
-        y[nan_location] = np.nan
-        ep = nap.IntervalSet([0, 10], [9, 500])
-        y = nap.Tsd(t=np.arange(y.shape[0]), d=y, time_support=ep)
-        model = fixture.model
-        posteriors = getattr(model, method_name)(X, y)
-        assert isinstance(posteriors, nap.TsdFrame), f"Did not return pynapple!"
-        assert np.all(
-            np.isnan(posteriors[nan_location])
-        ), f"Not returning NaNs in the expected location!"
-
-    @pytest.mark.parametrize(
-        "method_name", ["smooth_proba", "filter_proba", "decode_state"]
-    )
-    def test_int_vs_float_y(self, instantiate_base_regressor_subclass, method_name):
-        """Test that integer and float y with same values give same posteriors.
-
-        This is a regression test for a bug where y.dtype was used to cast params
-        before preprocessing, causing integer y to round float params to integers.
-        """
-        fixture = instantiate_base_regressor_subclass
-        X = fixture.X
-        y = round(fixture.y.copy())
-        y_float = y.astype(float)
-        y_int = y.astype(int)
-        model = fixture.model
-
-        # Get posteriors with float y
-        out_float = getattr(model, method_name)(X, y_float)
-
-        # Get posteriors with int y (same values)
-        out_int = getattr(model, method_name)(X, y_int)
-
-        # Posteriors should be identical regardless of y dtype
-        np.testing.assert_allclose(
-            out_float,
-            out_int,
-            rtol=1e-10,
-            err_msg=f"{method_name} gives different results for int vs float y with same values",
-        )
-
-    def test_onehot_vs_index_decode(self, instantiate_base_regressor_subclass):
-        fixture = instantiate_base_regressor_subclass
-        X = fixture.X
-        y = fixture.y
-        model = fixture.model
-        out_onehot = model.decode_state(X, y, output_format="one-hot")
-        out_index = model.decode_state(X, y, output_format="index")
-        assert jnp.all(jnp.where(out_onehot == 1)[1] == out_index), "index and one-hot do not match!"
-        assert jnp.all(out_onehot.sum(axis=1) == 1), "more than one hot value in one-hot array!"
-
-@pytest.mark.parametrize("n_states", [2, 3, 5])
-@pytest.mark.parametrize(
-    "method_name", ["smooth_proba", "filter_proba", "decode_state"]
-)
-def test_different_n_states(n_states, method_name):
-    """Test smooth_proba with different numbers of states."""
-    np.random.seed(123)
-    n_samples, n_features = 100, 2
-    X = np.random.randn(n_samples, n_features)
-    y = np.random.poisson(2, size=n_samples)
-
-    model = nmo.glm_hmm.GLMHMM(
-        n_states=n_states,
-        observation_model="Poisson",
-        solver_kwargs={"maxiter": 2},
-    )
-    model.fit(X, y)
-
-    out = getattr(model, method_name)(X, y)
-
-    # Check shape
-    assert out.shape == (
-        n_samples,
-        n_states,
-    ), f"Expected shape ({n_samples}, {n_states}), got {out.shape}"
-
-    # Check probabilities are valid
-    assert jnp.all(out >= 0)
-    assert jnp.all(out <= 1)
-    row_sums = jnp.sum(out, axis=1)
-    assert jnp.allclose(row_sums, 1.0)

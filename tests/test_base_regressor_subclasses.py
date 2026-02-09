@@ -35,22 +35,12 @@ MODEL_REGISTRY = {
     "GLMHMM": nmo.glm_hmm.GLMHMM,
 }
 
-VALIDATOR_REGISTRY = {
-    "GLM": GLMValidator(),
-    "ClassifierGLM": ClassifierGLMValidator(extra_params={"n_classes": 4}),
-    "ClassifierPopulationGLM": PopulationClassifierGLMValidator(
-        extra_params={"n_classes": 4}
-    ),
-    "PopulationGLM": PopulationGLMValidator(),
-    "GLMHMM": GLMHMMValidator(n_states=3),
-}
-
 INIT_PARAM_LENGTH = {
     "GLM": 2,
     "ClassifierGLM": 2,
     "ClassifierPopulationGLM": 2,
     "PopulationGLM": 2,
-    "GLMHMM": 5,
+    "GLMHMM": 3,
 }
 
 DEFAULT_OBS_SHAPE = {
@@ -62,6 +52,23 @@ DEFAULT_OBS_SHAPE = {
 }
 
 HARD_CODED_GET_PARAMS_KEYS = {
+    "GLMHMM": {
+        "dirichlet_prior_alphas_init_prob",
+        "dirichlet_prior_alphas_transition",
+        "initialize_glm_params",
+        "initialize_init_proba",
+        "initialize_transition_proba",
+        "inverse_link_function",
+        "maxiter",
+        "n_states",
+        "observation_model",
+        "regularizer",
+        "regularizer_strength",
+        "seed",
+        "solver_kwargs",
+        "solver_name",
+        "tol",
+    },
     "GLM": {
         "inverse_link_function",
         "observation_model",
@@ -130,13 +137,7 @@ MODEL_WITH_LINK_FUNCTION_REGISTRY = {
     "GLMHMM": nmo.glm_hmm.GLMHMM,
 }
 
-DEFAULTS = {
-    "GLM": dict(),
-    "PopulationGLM": dict(),
-    "ClassifierGLM": dict(),
-    "ClassifierPopulationGLM": dict(),
-    "GLMHMM": dict(n_states=3),
-}
+DEFAULTS = {"GLMHMM": dict(n_states=3), "GLM": dict(), "PopulationGLM": dict()}
 
 
 INSTANTIATE_MODEL_ONLY = [
@@ -390,6 +391,211 @@ class TestModelCommons:
         actual_values = model.get_params()
         assert set(model.get_params().keys()) == expected_keys
         assert all(np.all(actual_values[k] == v) for k, v in expected_values.items())
+
+    @pytest.mark.parametrize(
+        "n_params",
+        [0, 1, 2, 3, 4],
+    )
+    @pytest.mark.solver_related
+    def test_initialize_solver_param_length(
+        self, n_params, instantiate_base_regressor_subclass
+    ):
+        """
+        Test the `initialize_solver` method with different numbers of initial parameters.
+        Check for correct number of parameters.
+        """
+        fixture = instantiate_base_regressor_subclass
+        X, model, true_params = fixture.X, fixture.model, fixture.params
+
+        model_name = model.__class__.__name__
+        y = np.zeros(DEFAULT_OBS_SHAPE[model_name])
+        expectation = (
+            pytest.raises(
+                ValueError,
+                match="Params must have length.|GLM-HMM requires three parameters",
+            )
+            if n_params != INIT_PARAM_LENGTH[model_name]
+            else does_not_raise()
+        )
+
+        if n_params < INIT_PARAM_LENGTH[model_name]:
+            init_params = true_params[:n_params]
+        else:
+            init_params = true_params + (true_params[0],) * (
+                n_params - INIT_PARAM_LENGTH[model_name]
+            )
+        with expectation:
+            params = model.initialize_params(X, y, init_params=init_params)
+            # check that params are set
+            init_state = model.initialize_state(X, y, params)
+            # optimistix solvers do not have a velocity attr
+            assert getattr(init_state, "velocity", params) == params
+
+    @pytest.mark.parametrize(
+        "delta_dim, expectation",
+        [
+            (-1, pytest.raises(ValueError, match="X must be two-dimensional")),
+            (0, does_not_raise()),
+            (1, pytest.raises(ValueError, match="X must be two-dimensional")),
+        ],
+    )
+    @pytest.mark.solver_related
+    def test_initialize_solver_x_dimensionality(
+        self, delta_dim, expectation, instantiate_base_regressor_subclass
+    ):
+        """
+        Test the `initialize_solver` method with X input data of different dimensionalities.
+
+        Ensure correct dimensionality for X.
+        """
+        fixture = instantiate_base_regressor_subclass
+        X, model, true_params = fixture.X, fixture.model, fixture.params
+        y = np.zeros(DEFAULT_OBS_SHAPE[model.__class__.__name__])
+        if delta_dim == -1:
+            X = np.zeros((X.shape[0],))
+        elif delta_dim == 1:
+            X = np.zeros((X.shape[0], 1, X.shape[1]))
+        with expectation:
+            params = model.initialize_params(X, y, init_params=true_params)
+            # check that params are set
+            init_state = model.initialize_state(X, y, params)
+            # optimistix solvers do not have a velocity attr
+            assert getattr(init_state, "velocity", params) == params
+
+    @pytest.mark.parametrize(
+        "delta_dim, expectation",
+        [
+            (-1, pytest.raises(ValueError, match="y must be ...-dimensional")),
+            (0, does_not_raise()),
+            (1, pytest.raises(ValueError, match="y must be ...-dimensional")),
+        ],
+    )
+    @pytest.mark.solver_related
+    def test_initialize_solver_y_dimensionality(
+        self, delta_dim, expectation, instantiate_base_regressor_subclass
+    ):
+        """
+        Test the `initialize_solver` method with y target data of different dimensionalities.
+
+        Ensure correct dimensionality for y.
+        """
+        fixture = instantiate_base_regressor_subclass
+        X, model, true_params = fixture.X, fixture.model, fixture.params
+        y = np.zeros(DEFAULT_OBS_SHAPE[model.__class__.__name__])
+        if is_population_model(model):
+            if delta_dim == -1:
+                y = y[:, 0]
+            elif delta_dim == 1:
+                y = np.zeros((*y.shape, 1))
+        else:
+            if delta_dim == -1:
+                y = np.zeros([])
+            elif delta_dim == 1:
+                y = np.zeros((y.shape[0], 1))
+        with expectation:
+            params = model.initialize_params(X, y, init_params=true_params)
+            # check that params are set
+            init_state = model.initialize_state(X, y, params)
+            # optimistix solvers do not have a velocity attr
+            assert getattr(init_state, "velocity", params) == params
+
+    @pytest.mark.parametrize(
+        "delta_n_features, expectation",
+        [
+            (-1, pytest.raises(ValueError, match="Inconsistent number of features")),
+            (0, does_not_raise()),
+            (1, pytest.raises(ValueError, match="Inconsistent number of features")),
+        ],
+    )
+    @pytest.mark.solver_related
+    def test_initialize_solver_n_feature_consistency_x(
+        self, delta_n_features, expectation, instantiate_base_regressor_subclass
+    ):
+        """
+        Test the `initialize_solver` method for inconsistencies between data features and model's expectations.
+        Ensure the number of features in X aligns.
+        """
+        fixture = instantiate_base_regressor_subclass
+        X, model, true_params = fixture.X, fixture.model, fixture.params
+        y = np.zeros(DEFAULT_OBS_SHAPE[model.__class__.__name__])
+        if delta_n_features == 1:
+            X = jnp.concatenate((X, jnp.zeros((X.shape[0], 1))), axis=1)
+        elif delta_n_features == -1:
+            X = X[..., :-1]
+        with expectation:
+            params = model.initialize_params(X, y, init_params=true_params)
+            # check that params are set
+            init_state = model.initialize_state(X, y, params)
+            # optimistix solvers do not have a velocity attr
+            assert getattr(init_state, "velocity", params) == params
+
+    @pytest.mark.parametrize(
+        "delta_tp, expectation",
+        [
+            (
+                -1,
+                pytest.raises(ValueError, match="The number of time-points in X and y"),
+            ),
+            (0, does_not_raise()),
+            (
+                1,
+                pytest.raises(ValueError, match="The number of time-points in X and y"),
+            ),
+        ],
+    )
+    @pytest.mark.solver_related
+    def test_initialize_solver_time_points_x(
+        self, delta_tp, expectation, instantiate_base_regressor_subclass
+    ):
+        """
+        Test the `initialize_solver` method for inconsistencies in time-points in data X.
+
+        Ensure the correct number of time-points.
+        """
+        fixture = instantiate_base_regressor_subclass
+        X, model, true_params = fixture.X, fixture.model, fixture.params
+        y = np.zeros(DEFAULT_OBS_SHAPE[model.__class__.__name__])
+        X = jnp.zeros((X.shape[0] + delta_tp,) + X.shape[1:])
+        with expectation:
+            params = model.initialize_params(X, y, init_params=true_params)
+            # check that params are set
+            init_state = model.initialize_state(X, y, params)
+            # optimistix solvers do not have a velocity attr
+            assert getattr(init_state, "velocity", params) == params
+
+    @pytest.mark.parametrize(
+        "delta_tp, expectation",
+        [
+            (
+                -1,
+                pytest.raises(ValueError, match="The number of time-points in X and y"),
+            ),
+            (0, does_not_raise()),
+            (
+                1,
+                pytest.raises(ValueError, match="The number of time-points in X and y"),
+            ),
+        ],
+    )
+    @pytest.mark.solver_related
+    def test_initialize_solver_time_points_y(
+        self, delta_tp, expectation, instantiate_base_regressor_subclass
+    ):
+        """
+        Test the `initialize_solver` method for inconsistencies in time-points in y.
+
+        Ensure the correct number of time-points.
+        """
+        fixture = instantiate_base_regressor_subclass
+        X, y, model, true_params = fixture.X, fixture.y, fixture.model, fixture.params
+        shape = DEFAULT_OBS_SHAPE[model.__class__.__name__]
+        y = jnp.zeros((shape[0] + delta_tp,) + shape[1:])
+        with expectation:
+            params = model.initialize_params(X, y, init_params=true_params)
+            # check that params are set
+            init_state = model.initialize_state(X, y, params)
+            # optimistix solvers do not have a velocity attr
+            assert getattr(init_state, "velocity", params) == params
 
     @pytest.mark.solver_related
     def test_initialize_solver_mask_grouplasso(

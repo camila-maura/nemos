@@ -1,130 +1,94 @@
 """API for the GLM-HMM model."""
 
-import warnings
 from numbers import Number
 from pathlib import Path
 from typing import Any, Callable, Literal, NamedTuple, Optional, Tuple, Union
 
-import equinox as eqx
 import jax
 import jax.numpy as jnp
 import pynapple as nap
 from numpy.typing import ArrayLike, NDArray
 
 from .. import observation_models as obs
-from .. import tree_utils
+from .. import tree_utils, validation
 from .._observation_model_builder import instantiate_observation_model
 from ..base_regressor import BaseRegressor
+from ..glm import GLM
 from ..inverse_link_function_utils import resolve_inverse_link_function
 from ..observation_models import Observations
+from ..pytrees import FeaturePytree
 from ..regularizer import GroupLasso, Lasso, Regularizer, Ridge
-from ..type_casting import cast_to_jax, is_pynapple_tsd, support_pynapple
-from ..typing import (
-    DESIGN_INPUT_TYPE,
-    FeaturePytree,
-    SolverState,
-    StepResult,
+from ..third_party.jaxopt import jaxopt
+from ..type_casting import (
+    is_numpy_array_like,
+    is_pynapple_tsd,
+    jnp_asarray_if,
 )
-from ..utils import format_repr
-from . import forward_backward
-from .algorithm_configs import (
-    get_analytical_scale_update,
-    prepare_estep_log_likelihood,
-    prepare_mstep_nll_objective_param,
-    prepare_mstep_nll_objective_scale,
-)
+from ..typing import DESIGN_INPUT_TYPE, RegularizerStrength
 from .expectation_maximization import (
-    GLMHMMState,
     em_glm_hmm,
-    em_step,
-    forward_pass,
-    max_sum,
+    hmm_negative_log_likelihood,
+    prepare_likelihood_func,
 )
 from .initialize_parameters import (
-    INITIALIZATION_FN_DICT,
-    _is_native_init_registry,
-    _resolve_init_funcs_registry,
-    glm_hmm_initialization,
-    resolve_dirichlet_priors,
+    random_glm_params_init,
+    resolve_glm_params_init_function,
+    resolve_initial_state_proba_init_function,
+    resolve_transition_proba_init_function,
+    sticky_transition_proba_init,
+    uniform_initial_proba_init,
 )
-from .params import GLMHMMParams, GLMHMMUserParams, GLMParams, GLMScale, HMMParams
-from .validation import GLMHMMValidator
+
+ModelParams = Tuple[Tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray, jnp.ndarray]
 
 
-def compute_is_new_session(
-    time: NDArray | jnp.ndarray,
-    start: NDArray | jnp.ndarray,
-    is_nan: Optional[NDArray | jnp.ndarray] = None,
-) -> jnp.ndarray:
-    """Compute indicator vector marking the start of new sessions.
-
-    This function identifies session boundaries in time-series data by marking positions
-    where new epochs begin or where data resumes after NaN values. When NaN values are
-    present, the first valid sample immediately following each NaN is marked as a new
-    session start.
+def compute_is_new_session(time: NDArray, start: NDArray) -> jnp.ndarray:
+    """Compute new session indicator vector.
 
     Parameters
     ----------
-    time :
-        Timestamps for each sample in the time series, shape ``(n_time_points,)``.
-        Must be monotonically increasing.
-    start :
-        Start times marking the beginning of each epoch or session, shape ``(n_epochs,)``.
-        Each value should correspond to a timestamp in ``time``.
-    is_nan :
-        Boolean array indicating NaN positions, shape ``(n_time_points,)``.
-        If provided, positions immediately after NaNs will be marked as new session starts.
-
-    Returns
-    -------
-    is_new_session :
-        Binary indicator array of shape ``(n_time_points,)`` where 1 indicates the start
-        of a new session and 0 otherwise.
-
-    Notes
-    -----
-    The function marks positions as new sessions in two cases:
-    1. Positions matching epoch start times (from ``start`` parameter)
-    2. Positions immediately following NaN values (when ``is_nan`` is provided)
-
-    This ensures that after dropping NaN values, session boundaries are preserved.
+    time:
+        The timestamp associated to each sample.
+    start:
+        Start times of each new epoch/session.
     """
-    is_new_session = (
-        jax.numpy.zeros_like(time).at[jax.numpy.searchsorted(time, start)].set(1)
-    )
-    if is_nan is not None:
-        # set the first element after nan as new session beginning
-        is_new_session = is_new_session.at[1:].set(
-            jnp.where(is_nan[:-1], 1, is_new_session[1:])
-        )
-    return is_new_session
+    return jax.numpy.zeros_like(time).at[jax.numpy.searchsorted(time, start)].set(1)
 
 
-class GLMHMM(BaseRegressor[GLMHMMUserParams, GLMHMMParams]):
+class GLMHMM(BaseRegressor[ModelParams]):
     """GLM-HMM model."""
 
     def __init__(
         self,
         n_states: int,
         observation_model: (
-            Observations
-            | Literal["Poisson", "Gamma", "Bernoulli", "NegativeBinomial", "Gaussian"]
+            Observations | Literal["Poisson", "Gamma", "Bernoulli", "NegativeBinomial"]
         ) = "Bernoulli",
-        inverse_link_function: Optional[Callable[[jnp.ndarray], jnp.ndarray]] = None,
-        regularizer: Optional[Union[str, Regularizer]] = None,
+        inverse_link_function: Callable = jax.lax.logistic,
+        regularizer: Union[
+            str, Regularizer
+        ] = "UnRegularized",  # this applies only for the regularization of the glm coefficients.
         regularizer_strength: Optional[
-            Any
+            RegularizerStrength
         ] = None,  # this is used to regularize GLM coef.
         # prior to regularize init prob and transition
-        dirichlet_prior_alphas_init_prob: Union[
-            jnp.ndarray, None
-        ] = None,  # (n_state, )
-        dirichlet_prior_alphas_transition: Union[
+        dirichlet_prior_alphas_init_prob: jnp.ndarray | None = None,  # (n_state, )
+        dirichlet_prior_alphas_transition: (
             jnp.ndarray | None
-        ] = None,  # (n_state, n_state)
+        ) = None,  # (n_state, n_state)
         solver_name: str = None,
         solver_kwargs: Optional[dict] = None,
-        initialization_funcs: Optional[INITIALIZATION_FN_DICT] = None,
+        initialize_init_proba: (
+            Callable[[DESIGN_INPUT_TYPE, NDArray], NDArray] | NDArray | str
+        ) = uniform_initial_proba_init,
+        initialize_transition_proba: (
+            Callable[[DESIGN_INPUT_TYPE, NDArray], NDArray] | NDArray | str
+        ) = sticky_transition_proba_init,
+        initialize_glm_params: (
+            Callable[[DESIGN_INPUT_TYPE, NDArray], Tuple[jnp.ndarray, jnp.ndarray]]
+            | Tuple[jnp.ndarray, jnp.ndarray]
+            | str
+        ) = random_glm_params_init,
         maxiter: int = 1000,
         tol: float = 1e-8,
         seed=jax.random.PRNGKey(123),
@@ -135,17 +99,18 @@ class GLMHMM(BaseRegressor[GLMHMMUserParams, GLMHMMParams]):
             solver_name=solver_name,
             solver_kwargs=solver_kwargs,
         )
-        self.n_states = n_states
+        self._n_states = n_states
         self.observation_model = observation_model
         self.inverse_link_function = inverse_link_function
 
-        # assign defaults to initialization functions
-        self.initialization_funcs = initialization_funcs
+        # check and store initialization hyperparameters.
+        self.initialize_glm_params = initialize_glm_params
+        self.initialize_transition_proba = initialize_transition_proba
+        self.initialize_init_proba = initialize_init_proba
 
         # set the prior params
         self.dirichlet_prior_alphas_init_prob = dirichlet_prior_alphas_init_prob
         self.dirichlet_prior_alphas_transition = dirichlet_prior_alphas_transition
-
         self.seed = seed
         self.maxiter = maxiter
         self.tol = tol
@@ -177,48 +142,43 @@ class GLMHMM(BaseRegressor[GLMHMMUserParams, GLMHMMParams]):
             ]
             | None
         ) = None
-
-        # fit attributes
+        # parameters
+        self.glm_params_: Tuple[dict | jnp.ndarray, jnp.ndarray] | None = None
         self.transition_prob_: jnp.ndarray | None = None
         self.initial_prob_: jnp.ndarray | None = None
-        self.coef_: jnp.ndarray | None = None
-        self.intercept_: jnp.ndarray | None = None
         self.solver_state_: NamedTuple | None = None
-        self.scale_: jnp.ndarray | None = None
+        self.scale_: float | None = None
         self.dof_resid_: int | None = None
 
     @property
-    def n_states(self) -> int:
-        """Number of hidden states of the HMM."""
-        return self._n_states
+    def coef_(self):
+        """The GLM coefficients."""
+        if self.glm_params_ is not None:
+            return self.glm_params_[0]
+        return None
 
-    @n_states.setter
-    def n_states(self, n_states: int):
-        # quick sanity check and assignment
-        if isinstance(n_states, int) and n_states > 0:
-            self._n_states = n_states
-            self._validator: GLMHMMValidator = GLMHMMValidator(n_states=n_states)
-            return
+    @coef_.setter
+    def coef_(self, value):
+        intercept = self.intercept_
+        if value is None and intercept is None:
+            self.glm_params_ = None
+        else:
+            self.glm_params_ = (value, intercept)
 
-        # further checks for other valid numeric types (like non-negative float with no-decimals)
-        if not isinstance(n_states, Number):
-            raise TypeError(
-                f"n_states must be a positive integer. "
-                f"n_states is of type ``{type(n_states)}`` instead."
-            )
+    @property
+    def intercept_(self):
+        """The GLM intercepts."""
+        if self.glm_params_ is not None:
+            return self.glm_params_[1]
+        return None
 
-        # provided a non-integer number (check that has no decimals)
-        int_n_states = int(n_states)
-        if int_n_states != int(n_states):
-            raise TypeError(
-                f"n_states must be a positive integer. ``{n_states}`` provided instead."
-            )
-        elif int_n_states < 1:
-            raise ValueError(
-                f"n_states must be a positive integer. ``{n_states}`` provided instead."
-            )
-        self._n_states = int_n_states
-        self._validator = GLMHMMValidator(n_states=n_states)
+    @intercept_.setter
+    def intercept_(self, value):
+        coef = self.coef_
+        if value is None and coef is None:
+            self.glm_params_ = None
+        else:
+            self.glm_params_ = (coef, value)
 
     @property
     def maxiter(self):
@@ -253,18 +213,50 @@ class GLMHMM(BaseRegressor[GLMHMMUserParams, GLMHMMParams]):
 
         if not isinstance(tol, Number) or tol <= 0:
             raise ValueError(
-                f"``tol`` must be a strictly positive float. {tol} provided."
+                f"``maxiter`` must be a strictly positive float. {tol} provided."
             )
         self._tol = float(tol)
 
     @property
-    def initialization_funcs(self):
-        """Dictionary of initialization functions for model parameters."""
-        return self._initialization_funcs
+    def initialize_glm_params(self):
+        """Initialization of glm coef and intercept for the GLM."""
+        return self._initialize_glm_params
 
-    @initialization_funcs.setter
-    def initialization_funcs(self, initialization_funcs: INITIALIZATION_FN_DICT):
-        self._initialization_funcs = _resolve_init_funcs_registry(initialization_funcs)
+    @initialize_glm_params.setter
+    def initialize_glm_params(self, glm_params):
+        glm_params = resolve_glm_params_init_function(glm_params)
+        check_values = (
+            isinstance(glm_params, tuple)
+            and len(glm_params) == 2
+            and all(isinstance(arr, jax.numpy.ndarray) for arr in glm_params)
+        )
+        if check_values:
+            self._check_initial_glm_params(glm_params)
+        self._initialize_glm_params = glm_params
+
+    @property
+    def initialize_init_proba(self):
+        """Initialization of initial state probabilities."""
+        return self._initialize_init_proba
+
+    @initialize_init_proba.setter
+    def initialize_init_proba(self, initial_prob):
+        initial_prob = resolve_initial_state_proba_init_function(initial_prob)
+        if isinstance(initial_prob, jnp.ndarray):
+            self._check_init_state_proba(initial_prob)
+        self._initialize_init_proba = initial_prob
+
+    @property
+    def initialize_transition_proba(self):
+        """Initialization of the transition probabilities."""
+        return self._initialize_transition_proba
+
+    @initialize_transition_proba.setter
+    def initialize_transition_proba(self, transition_prob):
+        transition_prob = resolve_transition_proba_init_function(transition_prob)
+        if isinstance(transition_prob, jnp.ndarray):
+            self._check_transition_proba(transition_prob)
+        self._initialize_transition_proba = transition_prob
 
     @property
     def dirichlet_prior_alphas_init_prob(self) -> jnp.ndarray | None:
@@ -276,9 +268,27 @@ class GLMHMM(BaseRegressor[GLMHMMUserParams, GLMHMMParams]):
 
     @dirichlet_prior_alphas_init_prob.setter
     def dirichlet_prior_alphas_init_prob(self, value: jnp.ndarray | None):
-        self._dirichlet_prior_alphas_init_prob = resolve_dirichlet_priors(
-            value, (self._n_states,)
-        )
+        if value is None:
+            self._dirichlet_prior_alphas_init_prob = None
+        elif is_numpy_array_like(value)[1]:
+            value = jnp.asarray(value, dtype=float)
+            if value.shape != (self._n_states,):
+                raise ValueError(
+                    f"Dirichlet prior alpha parameters for initial state probabilities "
+                    f"must have shape ({self._n_states},), "
+                    f"but got shape {value.shape}."
+                )
+            if not jnp.all(value > 0):
+                raise ValueError(
+                    f"Dirichlet prior alpha parameters must be strictly positive, but got values with "
+                    f"zero or negative entries: {value}"
+                )
+            self._dirichlet_prior_alphas_init_prob = value
+        else:
+            raise TypeError(
+                f"Invalid type for Dirichlet prior alpha parameters: {type(value).__name__}. "
+                f"Must be None or an array-like object of shape ({self._n_states},) with strictly positive values."
+            )
 
     @property
     def dirichlet_prior_alphas_transition(self) -> jnp.ndarray | None:
@@ -290,12 +300,117 @@ class GLMHMM(BaseRegressor[GLMHMMUserParams, GLMHMMParams]):
 
     @dirichlet_prior_alphas_transition.setter
     def dirichlet_prior_alphas_transition(self, value: jnp.ndarray | None):
-        self._dirichlet_prior_alphas_transition = resolve_dirichlet_priors(
-            value, (self._n_states, self._n_states)
+        if value is None:
+            self._dirichlet_prior_alphas_transition = None
+        elif is_numpy_array_like(value)[1]:
+            value = jnp.asarray(value, dtype=float)
+            if value.shape != (self._n_states, self.n_states):
+                raise ValueError(
+                    "Dirichlet prior alpha parameters for transition probabilities must "
+                    f"have shape ({self._n_states}, {self._n_states}), "
+                    f"but got shape {value.shape}."
+                )
+            if not jnp.all(value > 0):
+                raise ValueError(
+                    f"Dirichlet prior alpha parameters must be strictly positive, but got values with "
+                    f"zero or negative entries: {value}"
+                )
+            self._dirichlet_prior_alphas_transition = value
+        else:
+            raise TypeError(
+                f"Invalid type for Dirichlet prior alpha parameters for transition probabilities: "
+                f"{type(value).__name__}. "
+                f"Must be None or an array-like object of shape ({self._n_states}, {self._n_states}) "
+                f"with strictly positive values."
+            )
+
+    def _check_initial_glm_params(
+        self,
+        params: Tuple[DESIGN_INPUT_TYPE | dict, jax.numpy.ndarray],
+    ):
+        coef, intercept = params
+        # check the dimensionality of coeff
+        err_message_shape = (
+            "params[0] (GLM coefficients) must be a two-dimensional array "
+            f"or nemos.pytree.FeaturePytree with array leafs of shape "
+            f"(n_features, {self._n_states})."
+        )
+        validation.check_tree_leaves_dimensionality(
+            params[0],
+            expected_dim=2,
+            err_message=err_message_shape,
         )
 
+        shape_coef = set(
+            jax.tree_util.tree_map(
+                lambda x: x.shape[1], jax.tree_util.tree_leaves(params[0])
+            )
+        )
+        if len(shape_coef) != 1 or shape_coef != {self._n_states}:
+            raise ValueError(err_message_shape)
+
+        if not isinstance(intercept, jnp.ndarray):
+            raise ValueError(
+                f"params[1] (GLM intercepts) must be a 1-dimensional array of shape ({self._n_states},). "
+                f"Provided params[1] is of type {type(intercept)} instead."
+            )
+        elif not intercept.shape == (self._n_states,):
+            raise ValueError(
+                f"params[1] (GLM intercepts) must be a 1-dimensional array of shape ({self._n_states},). "
+                f"Provided params[1] is of shape {intercept.shape} instead."
+            )
+
+    def _check_transition_proba(self, transition_prob: jax.numpy.ndarray):
+        if transition_prob.shape != (self._n_states, self._n_states):
+            raise ValueError(
+                f"Transition probability matrix shape mismatch: expected ({self._n_states}, {self._n_states}), "
+                f"but got {transition_prob.shape}."
+            )
+        if not jnp.allclose(jnp.sum(transition_prob, axis=1), 1):
+            row_sums = jnp.sum(transition_prob, axis=1)
+            raise ValueError(
+                f"Transition probability matrix rows must sum to 1. "
+                f"Each row i represents the probability distribution of transitioning from state i. "
+                f"Row sums: {row_sums}"
+            )
+
+    def _check_init_state_proba(self, initial_prob: jax.numpy.ndarray):
+        if initial_prob.shape != (self._n_states,):
+            raise ValueError(
+                f"Initial state probability vector shape mismatch: expected ({self._n_states},), "
+                f"but got {initial_prob.shape}."
+            )
+        if not jnp.allclose(initial_prob.sum(), 1):
+            raise ValueError(
+                f"Initial state probabilities must sum to 1, but got sum = {initial_prob.sum()}. "
+                f"Probabilities: {initial_prob}"
+            )
+
     @property
-    def observation_model(self) -> obs.Observations:
+    def n_states(self) -> int:
+        """Number of hidden states of the HMM."""
+        return self._n_states
+
+    @n_states.setter
+    def n_states(self, n_states: int):
+        if not isinstance(n_states, Number):
+            raise TypeError(
+                f"n_states must be a positive integer. "
+                f"n_states is of type `{type(n_states)}` instead."
+            )
+        int_n_states = int(n_states)
+        if int_n_states != int(n_states):
+            raise TypeError(
+                f"n_states must be a positive integer. `{n_states}` provided instead."
+            )
+        if int_n_states < 1:
+            raise ValueError(
+                f"n_states must be a positive integer. `{n_states}` provided instead."
+            )
+        self._n_states = int_n_states
+
+    @property
+    def observation_model(self) -> Union[None, obs.Observations]:
         """Getter for the ``observation_model`` attribute."""
         return self._observation_model
 
@@ -321,253 +436,75 @@ class GLMHMM(BaseRegressor[GLMHMMUserParams, GLMHMMParams]):
             inverse_link_function, self._observation_model
         )
 
-    @property
-    def seed(self):
-        """Random seed as a jax PRNG key."""
-        return self._seed
-
-    @seed.setter
-    def seed(self, value):
-        value = jnp.asarray(value)
-        # Validate it's a JAX PRNG key
-        if value.shape != (2,) or value.dtype != jnp.uint32:
-            raise TypeError(
-                f"seed must be a JAX PRNG key (jax.random.PRNGKey). "
-                f"Got {type(value)} with shape {getattr(value, 'shape', 'N/A')}"
-            )
-        self._seed = value
-
-    def _check_is_fit(self):
-        """Ensure the instance has been fitted."""
-        flat_params = [
-            self.coef_,
-            self.intercept_,
-            self.scale_,
-            self.initial_prob_,
-            self.transition_prob_,
-        ]
-        is_missing = [x is None for x in flat_params]
-        if any(is_missing):
-            param_labels = [
-                "coef_",
-                "intercept_",
-                "scale_",
-                "initial_prob_",
-                "transition_prob_",
-            ]
-            missing_params = [
-                p for p, missing in zip(param_labels, is_missing) if missing
-            ]
-            raise ValueError(
-                "This GLMHMM instance is not fitted yet. The following attributes are not set:"
-                f" {missing_params}.\nPlease fit the GLM-HMM model first or "
-                "set the missing attributes."
-            )
-
-    def _model_specific_initialization(
-        self,
-        X: DESIGN_INPUT_TYPE,
-        y: jnp.ndarray,
-    ) -> GLMHMMParams:
-        """GLM-HMM initialization."""
-        user_params = glm_hmm_initialization(
-            self._n_states,
-            X,
-            y,
-            inverse_link_function=self._inverse_link_function,
-            random_key=self._seed,
-        )
-
-        # check if registry uses NeMoS init funcs
-        is_nemos_init = _is_native_init_registry(self._initialization_funcs)
-        if is_nemos_init:
-            # skip validation and just cast
-            return self._validator.to_model_params(user_params)
-
-        # params casting with validation
-        model_params = self._validator.validate_and_cast_params(user_params)
-        self._validator.validate_consistency(model_params, X=X, y=y)
-        return model_params
-
-    def _initialize_optimization_and_state(
-        self,
-        X: DESIGN_INPUT_TYPE,
-        y: jnp.ndarray,
-        init_params: GLMHMMParams,
-    ) -> SolverState:
-        """Initialize the EM functions."""
-        # glm params m-step setup
-        is_population = y.ndim > 1
-        log_likelihood = prepare_estep_log_likelihood(
-            is_population_glm=is_population,
-            observation_model=self.observation_model,
-        )
-        objective = prepare_mstep_nll_objective_param(
-            is_population_glm=is_population,
-            observation_model=self._observation_model,
-            inverse_link_function=self._inverse_link_function,
-        )
-        _, _, glm_params_update_fn = self._instantiate_solver(
-            objective, init_params.glm_params
-        )
-
-        scale_update_fn = get_analytical_scale_update(
-            is_population_glm=is_population, observation_model=self._observation_model
-        )
-        if scale_update_fn is None:
-            objective_scale = prepare_mstep_nll_objective_scale(
-                is_population_glm=is_population,
-                observation_model=self._observation_model,
-            )
-            _, _, scale_update_fn = self._instantiate_solver(
-                objective_scale, init_params.glm_scale
-            )
-
-        # cannot wrap is_new_session, that's to be calculated at each update form the provided X and y.
-        # for consistency, do not make a partial of that argument in run as well.
-        self._optimization_run = eqx.Partial(
-            em_glm_hmm,
-            inverse_link_function=self.inverse_link_function,
-            log_likelihood_func=log_likelihood,
-            m_step_fn_glm_params=glm_params_update_fn,
-            m_step_fn_glm_scale=scale_update_fn,
-            maxiter=self.maxiter,
-            tol=self.tol,
-        )
-
-        self._optimization_update = eqx.Partial(
-            em_step,
-            inverse_link_function=self.inverse_link_function,
-            log_likelihood_func=log_likelihood,
-            m_step_fn_glm_params=glm_params_update_fn,
-            m_step_fn_glm_scale=scale_update_fn,
-        )
-
-        def init_state_fn(*args, **kwargs) -> SolverState:
-            state = GLMHMMState(
-                data_log_likelihood=-jnp.array(jnp.inf),
-                previous_data_log_likelihood=-jnp.array(jnp.inf),
-                log_likelihood_history=jnp.full(self.maxiter, jnp.nan),
-                iterations=0,
-            )
-            return state
-
-        self._optimization_init_state = init_state_fn
-        return init_state_fn()
-
-    @staticmethod
-    def _get_is_new_session(
-        X: DESIGN_INPUT_TYPE, y: ArrayLike | nap.Tsd | nap.TsdFrame
-    ) -> jnp.ndarray | None:
-        """Compute session boundary indicators for GLM-HMM time-series data.
-
-        Identifies session boundaries by detecting epoch starts and gaps in the data
-        (represented by NaN values in either predictors or response). This is essential
-        for GLM-HMM models to properly segment time series data and reset the hidden
-        state between discontinuous recordings.
-
-        Parameters
-        ----------
-        X :
-            Design matrix or predictor time series. Can be a pynapple Tsd/TsdFrame or
-            array-like of shape ``(n_time_points, n_features)``.
-        y :
-            Response variable time series of shape ``(n_time_points,)`` or
-            ``(n_time_points, n_neurons)``.
-
-        Returns
-        -------
-        is_new_session :
-            Binary indicator array of shape ``(n_time_points,)`` marking session starts
-            with 1s. Returns None if unable to compute session boundaries.
-
-        Notes
-        -----
-        Session boundaries are identified from:
-        - Epoch start times (when using pynapple Tsd objects with time_support)
-        - Positions immediately following NaN values in either X or y
-
-        When both X and y are pynapple objects, y's time information takes precedence.
-
-        For non-pynapple inputs, a default session structure is initialized based on
-        the length of y.
-
-        See Also
-        --------
-        compute_is_new_session : Core function for computing session indicators.
-        """
-        # compute the nan location along the sample axis
-        nan_y = jnp.any(jnp.isnan(jnp.asarray(y)).reshape(y.shape[0], -1), axis=1)
-        nan_x = jnp.any(jnp.isnan(jnp.asarray(X)).reshape(X.shape[0], -1), axis=1)
-        combined_nans = nan_y | nan_x
-
-        # define new session array
-        if is_pynapple_tsd(y):
-            is_new_session = compute_is_new_session(
-                y.t, y.time_support.start, combined_nans
-            )
-        elif is_pynapple_tsd(X):
-            is_new_session = compute_is_new_session(
-                X.t, X.time_support.start, combined_nans
-            )
-        else:
-            is_new_session = compute_is_new_session(
-                jnp.arange(X.shape[0]), jnp.array([0.0]), combined_nans
-            )
-        return is_new_session
-
     def fit(
         self,
         X: DESIGN_INPUT_TYPE,
         y: Union[NDArray, jnp.ndarray, nap.Tsd],
-        init_params: Optional[GLMHMMUserParams] = None,
+        init_params: Optional[
+            Tuple[Union[dict, ArrayLike], ArrayLike, ArrayLike, ArrayLike]
+        ] = None,
     ) -> "GLMHMM":
         """Fit the GLM-HMM model to the data."""
-        self._validator.validate_inputs(X=X, y=y)
-        is_new_session = self._get_is_new_session(X, y)
+
+        # define new session array
+        if is_pynapple_tsd(y):
+            is_new_session = compute_is_new_session(y.t, y.time_support.start)
+        elif is_pynapple_tsd(X):
+            is_new_session = compute_is_new_session(X.t, X.time_support.start)
+        else:
+            is_new_session = None
+
+        # cast to jax
+        X, y = jax.tree_util.tree_map(lambda x: jnp_asarray_if(x, dtype=float), (X, y))
 
         # validate the inputs & initialize solver
-        # initialize params if no params are provided
-        if init_params is None:
-            init_params = self._model_specific_initialization(X, y)
+        init_params = self.initialize_params(X, y, init_params=init_params)
+
+        # find non-nans
+        is_valid = tree_utils.get_valid_multitree(X, y)
+
+        # drop nans
+        X = jax.tree_util.tree_map(lambda x: x[is_valid], X)
+        y = jax.tree_util.tree_map(lambda x: x[is_valid], y)
+
+        # grab data if needed (tree map won't function because param is never a FeaturePytree).
+        if isinstance(X, FeaturePytree):
+            data = X.data
         else:
-            init_params = self._validator.validate_and_cast_params(init_params)
-            self._validator.validate_consistency(init_params, X=X, y=y)
+            data = X
 
-        self._validator.feature_mask_consistency(
-            getattr(self, "_feature_mask", None), init_params
+        self._likelihood_func, self._expected_negative_log_likelihood = (
+            self._get_m_step_loss_function(y.ndim > 1)
         )
-
-        # filter for non-nans, grab data if needed
-        data, y, is_new_session = self._preprocess_inputs(X, y, is_new_session)
-
-        # make sure is_new_session starts with a 1
-        is_new_session = is_new_session.at[0].set(True)
-
-        # set up optimization
-        self._initialize_optimization_and_state(data, y, init_params)
+        self.initialize_state(data, y, init_params=init_params)
 
         # run EM
+        glm_params, transition_prob, initial_prob = init_params
         (
-            fit_params,
+            _,
+            _,
+            self.initial_prob_,
+            self.transition_prob_,
+            self.glm_params_,
             self.solver_state_,
-        ) = self._optimization_run(
-            init_params, X=data, y=y, is_new_session=is_new_session
+        ) = em_glm_hmm(
+            data,
+            y,
+            initial_prob,
+            transition_prob,
+            glm_params,
+            self._inverse_link_function,
+            self._likelihood_func,
+            self._solver_run,
+            is_new_session,
+            self._maxiter,
+            self._tol,
         )
-
-        if self.solver_state_.iterations == self.maxiter:
-            warnings.warn(
-                "The fit did not converge. "
-                "Consider the following:"
-                "\n1) Enable float64 with ``jax.config.update('jax_enable_x64', True)``"
-                "\n2) Increase the ``maxiter`` parameter (max number of iterations of the EM) "
-                "or increase the ``tol`` parameter (tolerance).",
-                RuntimeWarning,
-            )
-
-        # assign fit attributes
-        self._set_model_params(fit_params)
-        self.dof_resid_ = self._estimate_resid_degrees_of_freedom(data)
+        self.dof_resid_ = self._estimate_resid_degrees_of_freedom(X)
+        print(self.dof_resid_)
+        # TODO: uncomment this once the predict method is available
+        # self.scale_ = self.observation_model.estimate_scale(y, self.predict(X), self.dof_resid_)
+        self.scale_ = 1.0
         return self
 
     def _estimate_resid_degrees_of_freedom(
@@ -593,6 +530,13 @@ class GLMHMM(BaseRegressor[GLMHMMUserParams, GLMHMMParams]):
         """
         # Convert a pytree to a design-matrix with pytrees
         X = jnp.hstack(jax.tree_util.tree_leaves(X))
+        dof_intercept_and_hmm = (
+            self._n_states  # intercept
+            + (
+                self._n_states - 1
+            )  # init prob (n values but sum to 1, so n-1 free values)
+            + (self._n_states - 1) * self._n_states
+        )  # transition n n-dim vectors that sum to 1
 
         if n_samples is None:
             n_samples = X.shape[0]
@@ -603,33 +547,24 @@ class GLMHMM(BaseRegressor[GLMHMMUserParams, GLMHMMParams]):
                     "instead!"
                 )
 
-        params = self._get_model_params()
-        coef = params.glm_params.coef
-        if coef.ndim == 3:
-            n_neurons = coef.shape[1]
+        params = self.glm_params_
+        if params[0].ndim == 3:
+            n_neurons = params[0].shape[1]
         else:
             n_neurons = 1
-
-        dof_intercept_and_hmm = (
-            self._n_states * n_neurons  # intercept
-            + (
-                self._n_states - 1
-            )  # init prob (n values but sum to 1, so n-1 free values)
-            + (self._n_states - 1) * self._n_states
-        )  # transition n n-dim vectors that sum to 1
-
         # if the regularizer is lasso use the non-zero
-        # coef as an estimate of the dof
+        # coeff as an estimate of the dof
         # see https://arxiv.org/abs/0712.0881
         if isinstance(self.regularizer, (GroupLasso, Lasso)):
             resid_dof = sum(
                 tree_utils.pytree_map_and_reduce(
                     lambda x: ~jnp.isclose(x, jnp.zeros_like(x)),
                     lambda x: sum([jnp.sum(i, axis=0) for i in x]),
-                    coef,
+                    params[0],
                 )
             )
             return n_samples - resid_dof - dof_intercept_and_hmm
+
         elif isinstance(self.regularizer, Ridge):
             # for Ridge, use the tot parameters (X.shape[1] + intercept)
             return (
@@ -640,34 +575,23 @@ class GLMHMM(BaseRegressor[GLMHMMUserParams, GLMHMMParams]):
             rank = jnp.linalg.matrix_rank(X)
             return (n_samples - rank - dof_intercept_and_hmm) * jnp.ones(n_neurons)
 
-    def _score(
+    def predict(
         self,
-        params: GLMHMMParams,
-        X: Union[DESIGN_INPUT_TYPE, ArrayLike],
-        y: Union[NDArray, jnp.ndarray, nap.Tsd],
-        is_new_session: jnp.ndarray,
-    ) -> jnp.ndarray:
-        """Private score compute."""
-        # filter for non-nans, grab data if needed
-        data, y, is_new_session = self._preprocess_inputs(X, y, is_new_session)
-        # safe conversion to jax arrays of float
-        params = jax.tree_util.tree_map(lambda x: jnp.asarray(x, y.dtype), params)
-
-        # make sure is_new_session starts with a 1
-        is_new_session = is_new_session.at[0].set(True)
-
-        # smooth with forward backward
-        _, log_norm = forward_pass(
-            params=params,
-            X=data,
-            y=y,
-            is_new_session=is_new_session,
-            log_likelihood_func=prepare_estep_log_likelihood(
-                y.ndim > 1, self.observation_model
-            ),
-            inverse_link_function=self._inverse_link_function,
-        )
-        return jnp.sum(log_norm)
+        X: DESIGN_INPUT_TYPE,
+        predict_type: Literal["most-likely", "per-state", "average"] = "most-likely",
+    ) -> jnp.ndarray | nap.Tsd | nap.TsdFrame:
+        """Compute predicted firing rate pet state."""
+        # output state
+        # per state
+        # (t, neu, states) pop
+        # (t, states) single neu
+        # most likely
+        # (t, neu) pop
+        # (t,) single neu
+        # average
+        # (t, neu)  pop
+        # (t,) single neu
+        pass
 
     def score(
         self,
@@ -676,21 +600,10 @@ class GLMHMM(BaseRegressor[GLMHMMUserParams, GLMHMMParams]):
         score_type: Literal[
             "log-likelihood", "pseudo-r2-McFadden", "pseudo-r2-Cohen"
         ] = "log-likelihood",
-        null_model: Optional[Literal["constant", "glm"]] = None,
+        aggregate_sample_scores: Callable = jnp.mean,
     ) -> jnp.ndarray:
         """Compute the model score."""
-        if score_type == "log-likelihood" and null_model is not None:
-            warnings.warn(
-                "The null model is not used for the log-likelihood computation.",
-                UserWarning,
-                stacklevel=2,
-            )
-        if score_type != "log-likelihood":
-            raise NotImplementedError(
-                f"score of type {score_type} not implemented yet!"
-            )
-        params, X, y, is_new_session = self._validate_and_prepare_inputs(X, y)
-        return self._score(params, X, y, is_new_session)
+        pass
 
     def simulate(
         self,
@@ -700,445 +613,210 @@ class GLMHMM(BaseRegressor[GLMHMMUserParams, GLMHMMParams]):
         """Simulate spikes from the model, returns neural activity and states."""
         pass
 
-    @support_pynapple(conv_type="jax")
-    def _smooth_proba(
-        self,
-        params: GLMHMMParams,
-        X: Union[DESIGN_INPUT_TYPE, ArrayLike],
-        y: Union[NDArray, jnp.ndarray, nap.Tsd],
-        is_new_session: jnp.ndarray,
-    ) -> jnp.ndarray:
-        # filter for non-nans, grab data if needed
-        valid = tree_utils.get_valid_multitree(X, y)
-        data, y, is_new_session = self._preprocess_inputs(X, y, is_new_session)
-
-        # safe conversion to jax arrays of float
-        params = jax.tree_util.tree_map(lambda x: jnp.asarray(x, y.dtype), params)
-
-        # make sure is_new_session starts with a 1
-        is_new_session = is_new_session.at[0].set(True)
-
-        # smooth with forward backward
-        log_posteriors, _, _, _, _, _ = forward_backward(
-            params=params,
-            X=data,
-            y=y,
-            is_new_session=is_new_session,
-            log_likelihood_func=prepare_estep_log_likelihood(
-                y.ndim > 1, self.observation_model
-            ),
-            inverse_link_function=self._inverse_link_function,
-        )
-        proba = jnp.exp(log_posteriors)
-        # renormalize (numerical precision due to exponentiation)
-        proba /= proba.sum(axis=1, keepdims=True)
-        # re-attach nans
-        proba = jnp.full((valid.shape[0], proba.shape[1]), jnp.nan).at[valid].set(proba)
-        return proba
-
-    def _validate_and_prepare_inputs(self, X, y):
-        """Validate and prepare inputs."""
-        # check if the model was fit
-        self._check_is_fit()
-        params = self._get_model_params()
-
-        # validate inputs
-        self._validator.validate_inputs(X=X, y=y)
-        self._validator.validate_consistency(params, X=X, y=y)
-
-        # compute new session indicator
-        is_new_session = self._get_is_new_session(X, y)
-        return params, X, y, is_new_session
-
-    def smooth_proba(
+    def predict_proba(
         self,
         X: Union[DESIGN_INPUT_TYPE, ArrayLike],
-        y: Union[NDArray, jnp.ndarray, nap.Tsd],
+        y: NDArray,
     ) -> jnp.ndarray | nap.TsdFrame:
-        """Compute smoothing posterior probabilities over hidden states.
-
-        Computes the probability of being in each hidden state at each time point,
-        conditioned on the entire observed sequence. This method uses the forward-backward
-        algorithm to incorporate information from both past and future observations,
-        providing optimal state estimates given all available data.
-
-        The smoothing posteriors answer: "Given all observations, what is the probability
-        that the system was in state k at time t?"
-
-        Parameters
-        ----------
-        X
-            Predictors, shape ``(n_time_points, n_features)``.
-        y
-            Observed neural activity, shape ``(n_time_points,)`` for single neuron or
-            ``(n_time_points, n_neurons)`` for population.
-
-        Returns
-        -------
-        posteriors
-            Smoothing posterior probabilities, shape ``(n_time_points, n_states)``.
-            Each row sums to 1 and represents the probability distribution over states
-            at that time point.
-
-        Raises
-        ------
-        ValueError
-            If the model has not been fit (``fit()`` must be called first).
-        ValueError
-            If inputs contain NaN values in the middle of epochs (only boundary NaNs allowed).
-        ValueError
-            If X and y have inconsistent shapes or features.
-
-        See Also
-        --------
-        filter_proba : Compute filtering posteriors (conditioned on past observations only).
-        decode_state : Compute most likely state sequence (Viterbi decoding).
-
-        Notes
-        -----
-        - Smoothing provides better state estimates than filtering because it uses all data
-        - The algorithm properly handles session boundaries and NaN values at epoch borders
-
-        Examples
-        --------
-        Fit a GLM-HMM and compute smoothing posteriors:
-
-        >>> import numpy as np
-        >>> import nemos as nmo
-        >>> # Generate example data
-        >>> np.random.seed(123)
-        >>> X = np.random.randn(100, 5)  # 100 time points, 5 features
-        >>> y = np.random.poisson(2, size=100)  # Poisson spike counts
-        >>>
-        >>> # Fit model with 3 hidden states
-        >>> model = nmo.glm_hmm.GLMHMM(n_states=3, observation_model="Poisson")
-        >>> model = model.fit(X, y)
-        >>> # Compute smoothing posteriors
-        >>> posteriors = model.smooth_proba(X, y)
-        >>> print(posteriors.shape)
-        (100, 3)
-        >>> # Each row sums to 1
-        >>> print(np.allclose(posteriors.sum(axis=1), 1.0))
-        True
-
-        Using with pynapple for time-series analysis:
-
-        >>> import pynapple as nap
-        >>> # Create time-indexed data
-        >>> t = np.arange(100) * 0.01  # 10ms bins
-        >>> X_tsd = nap.TsdFrame(t=t, d=X)
-        >>> y_tsd = nap.Tsd(t=t, d=y)
-        >>>
-        >>> # Posteriors returned as TsdFrame
-        >>> posteriors_tsd = model.smooth_proba(X_tsd, y_tsd)
-        >>> print(type(posteriors_tsd))
-        <class 'pynapple.core.time_series.TsdFrame'>
-        """
-        params, X, y, is_new_session = self._validate_and_prepare_inputs(X, y)
-        return self._smooth_proba(params, X, y, is_new_session)
-
-    @support_pynapple(conv_type="jax")
-    def _filter_proba(
-        self,
-        params: GLMHMMParams,
-        X: Union[DESIGN_INPUT_TYPE, ArrayLike],
-        y: Union[NDArray, jnp.ndarray, nap.Tsd],
-        is_new_session: jnp.ndarray,
-    ) -> jnp.ndarray:
-        """Compute filtering probabilities without validation (internal method)."""
-        # filter for non-nans, grab data if needed
-        valid = tree_utils.get_valid_multitree(X, y)
-        data, y, is_new_session = self._preprocess_inputs(X, y, is_new_session)
-
-        # safe conversion to jax arrays of float
-        params = jax.tree_util.tree_map(lambda x: jnp.asarray(x, y.dtype), params)
-
-        # make sure is_new_session starts with a 1
-        is_new_session = is_new_session.at[0].set(True)
-        log_proba, _ = forward_pass(
-            params,
-            data,
-            y,
-            inverse_link_function=self._inverse_link_function,
-            is_new_session=is_new_session,
-            log_likelihood_func=prepare_estep_log_likelihood(
-                y.ndim > 1, self.observation_model
-            ),
-        )
-        proba = jnp.exp(log_proba)
-        # renormalize (numerical errors due to exponentiating)
-        proba /= proba.sum(axis=1, keepdims=True)
-        # re-attach nans
-        proba = jnp.full((valid.shape[0], proba.shape[1]), jnp.nan).at[valid].set(proba)
-        return proba
-
-    def filter_proba(
-        self,
-        X: Union[DESIGN_INPUT_TYPE, ArrayLike],
-        y: Union[NDArray, jnp.ndarray, nap.Tsd],
-    ) -> jnp.ndarray | nap.TsdFrame:
-        """Compute filtering posterior probabilities over hidden states.
-
-        Computes the probability of being in each hidden state at each time point,
-        conditioned only on observations up to that time point. This method uses the
-        forward pass of the forward-backward algorithm, providing causal (online) state
-        estimates that only use past and current observations.
-
-        The filtering posteriors answer: "Given observations up to time t, what is the
-        probability that the system is in state k at time t?"
-
-        Parameters
-        ----------
-        X
-            Predictors, shape ``(n_time_points, n_features)``.
-        y
-            Observed neural activity, shape ``(n_time_points,)`` for single neuron or
-            ``(n_time_points, n_neurons)`` for population.
-
-        Returns
-        -------
-        posteriors
-            Filtering posterior probabilities, shape ``(n_time_points, n_states)``.
-            Each row sums to 1 and represents the probability distribution over states
-            at that time point conditioned on past observations.
-
-        Raises
-        ------
-        ValueError
-            If the model has not been fit (``fit()`` must be called first).
-        ValueError
-            If inputs contain NaN values in the middle of epochs (only boundary NaNs allowed).
-        ValueError
-            If X and y have inconsistent shapes or features.
-
-        See Also
-        --------
-        smooth_proba : Compute smoothing posteriors (conditioned on all observations).
-        decode_state : Compute most likely state sequence (Viterbi decoding).
-
-        Notes
-        -----
-        - Filtering provides causal state estimates suitable for online/real-time applications
-        - Smoothing provides better estimates but requires all data (non-causal)
-        - The algorithm properly handles session boundaries and NaN values at epoch borders
-        - NaN values are removed before inference, but session markers are preserved
-        - For pynapple inputs, the output TsdFrame has columns named "state_0", "state_1", etc.
-
-        Examples
-        --------
-        Fit a GLM-HMM and compute filtering posteriors:
-
-        >>> import numpy as np
-        >>> import nemos as nmo
-        >>> # Generate example data
-        >>> np.random.seed(123)
-        >>> X = np.random.randn(100, 5)  # 100 time points, 5 features
-        >>> y = np.random.poisson(2, size=100)  # Poisson spike counts
-        >>>
-        >>> # Fit model with 3 hidden states
-        >>> model = nmo.glm_hmm.GLMHMM(n_states=3, observation_model="Poisson")
-        >>> model = model.fit(X, y)
-        >>>
-        >>> # Compute filtering posteriors (causal/online)
-        >>> filter_posteriors = model.filter_proba(X, y)
-        >>> print(filter_posteriors.shape)
-        (100, 3)
-        >>> # Each row sums to 1
-        >>> print(np.allclose(filter_posteriors.sum(axis=1), 1.0))
-        True
-
-        Using with pynapple for real-time state estimation:
-
-        >>> import pynapple as nap
-        >>> # Create time-indexed data
-        >>> t = np.arange(100) * 0.01  # 10ms bins
-        >>> X_tsd = nap.TsdFrame(t=t, d=X)
-        >>> y_tsd = nap.Tsd(t=t, d=y)
-        >>>
-        >>> # Filtering posteriors returned as TsdFrame
-        >>> filter_tsd = model.filter_proba(X_tsd, y_tsd)
-        >>> print(type(filter_tsd))
-        <class 'pynapple.core.time_series.TsdFrame'>
-        """
-        params, X, y, is_new_session = self._validate_and_prepare_inputs(X, y)
-        return self._filter_proba(params, X, y, is_new_session)
-
-    @support_pynapple(conv_type="jax")
-    def _decode_state(
-        self,
-        params: GLMHMMParams,
-        X: Union[DESIGN_INPUT_TYPE, ArrayLike],
-        y: Union[NDArray, jnp.ndarray, nap.Tsd],
-        is_new_session: jnp.ndarray,
-        return_index: bool,
-    ) -> jnp.ndarray:
-        """Decode most likely state sequence without validation (internal method)."""
-        # filter for non-nans, grab data if needed
-        valid = tree_utils.get_valid_multitree(X, y)
-        data, y, is_new_session = self._preprocess_inputs(X, y, is_new_session)
-
-        # safe conversion to jax arrays of float
-        params = jax.tree_util.tree_map(lambda x: jnp.asarray(x, y.dtype), params)
-
-        # make sure is_new_session starts with a 1
-        is_new_session = is_new_session.at[0].set(True)
-
-        decoded_states = max_sum(
-            params,
-            data,
-            y,
-            inverse_link_function=self._inverse_link_function,
-            is_new_session=is_new_session,
-            log_likelihood_func=prepare_estep_log_likelihood(
-                y.ndim > 1, self.observation_model
-            ),
-            return_index=return_index,
-        )
-
-        # reattach nans
-        decoded_states = (
-            jnp.full((valid.shape[0], *decoded_states.shape[1:]), jnp.nan)
-            .at[valid]
-            .set(decoded_states)
-        )
-        return decoded_states
+        """Compute the smoothing posteriors over-states."""
+        pass
 
     def decode_state(
-        self,
-        X: Union[DESIGN_INPUT_TYPE, ArrayLike],
-        y: ArrayLike,
-        output_format: Literal["one-hot", "index"] = "one-hot",
+        self, X: Union[DESIGN_INPUT_TYPE, ArrayLike], y: ArrayLike
     ) -> jnp.ndarray | nap.TsdFrame:
-        """Compute the most likely hidden state sequence (Viterbi decoding).
+        """Compute the most likely states over samples."""
+        pass
 
-        Finds the single most likely sequence of hidden states that best explains
-        the observed data. This method uses the Viterbi (max-sum) algorithm to
-        compute the state sequence that maximizes the joint probability of states
-        and observations.
-
-        Unlike ``smooth_proba()`` and ``filter_proba()`` which return probability
-        distributions over states at each time point, this method makes a deterministic
-        choice of the single best state sequence.
-
-        The decoded states answer: "What is the most likely sequence of states that
-        generated the observed data?"
-
-        Parameters
-        ----------
-        X
-            Predictors, shape ``(n_time_points, n_features)``.
-        y
-            Observed neural activity, shape ``(n_time_points,)`` for single neuron or
-            ``(n_time_points, n_neurons)`` for population.
-        output_format
-            Format of the returned states:
-
-            - ``"one-hot"``: Binary matrix of shape ``(n_time_points, n_states)`` where
-              each row has a single 1 indicating the decoded state.
-            - ``"index"``: Integer array of shape ``(n_time_points,)`` with values
-              in ``[0, n_states-1]`` indicating the decoded state.
-
-        Returns
-        -------
-        decoded_states
-            Most likely state sequence:
-
-            - If ``output_format="one-hot"``: shape ``(n_time_points, n_states)``.
-              Each row is a one-hot vector with 1 in the position of the decoded state.
-            - If ``output_format="index"``: shape ``(n_time_points,)``.
-              Integer indices of the decoded states.
-
-        Raises
-        ------
-        ValueError
-            If the model has not been fit (``fit()`` must be called first).
-        ValueError
-            If inputs contain NaN values in the middle of epochs (only boundary NaNs allowed).
-        ValueError
-            If X and y have inconsistent shapes or features.
-
-        See Also
-        --------
-        smooth_proba : Compute smoothing posteriors (conditioned on all observations).
-        filter_proba : Compute filtering posteriors (conditioned on past observations only).
-
-        Notes
-        -----
-        - Viterbi decoding finds the globally optimal state sequence, not the sequence
-          of individually most likely states from ``smooth_proba()``
-        - This is a hard assignment (single best path) unlike probabilistic posteriors
-        - The algorithm properly handles session boundaries and NaN values at epoch borders
-        - Decoding is useful for segmenting continuous data into discrete behavioral states
-        - For uncertainty estimates about states, use ``smooth_proba()`` instead
-
-        Examples
-        --------
-        Fit a GLM-HMM and decode the most likely state sequence:
-
-        >>> import numpy as np
-        >>> import nemos as nmo
-        >>> # Generate example data
-        >>> np.random.seed(123)
-        >>> X = np.random.randn(100, 5)  # 100 time points, 5 features
-        >>> y = np.random.poisson(2, size=100)  # Poisson spike counts
-        >>>
-        >>> # Fit model with 3 hidden states
-        >>> model = nmo.glm_hmm.GLMHMM(n_states=3, observation_model="Poisson")
-        >>> model = model.fit(X, y)
-        >>>
-        >>> # Decode states as one-hot encoding
-        >>> states_onehot = model.decode_state(X, y, output_format="one-hot")
-        >>> print(states_onehot.shape)
-        (100, 3)
-        >>> # Each row has exactly one 1
-        >>> print(np.all(states_onehot.sum(axis=1) == 1))
-        True
-        >>>
-        >>> # Decode states as integer indices
-        >>> states_idx = model.decode_state(X, y, output_format="index")
-        >>> print(states_idx.shape)
-        (100,)
-        >>> print(states_idx[:10])  # First 10 decoded states
-        [...]
-
-        Using with pynapple for time-series state decoding:
-
-        >>> import pynapple as nap
-        >>> # suppress jax to numpy conversion warning
-        >>> nap.nap_config.suppress_conversion_warnings = True
-        >>> # Create time-indexed data
-        >>> t = np.arange(100) * 0.01  # 10ms bins
-        >>> X_tsd = nap.TsdFrame(t=t, d=X)
-        >>> y_tsd = nap.Tsd(t=t, d=y)
-        >>>
-        >>> # Decoded states returned as TsdFrame or Tsd
-        >>> states_tsd = model.decode_state(X_tsd, y_tsd, output_format="one-hot")
-        >>> print(type(states_tsd))
-        <class 'pynapple.core.time_series.TsdFrame'>
-        >>> # With index format, returns Tsd
-        >>> states_idx_tsd = model.decode_state(X_tsd, y_tsd, output_format="index")
-        >>> print(type(states_idx_tsd))
-        <class 'pynapple.core.time_series.Tsd'>
-        """
-        params, X, y, is_new_session = self._validate_and_prepare_inputs(X, y)
-        # define the return type for the max-sum
-        if output_format == "one-hot":
-            return_index = False
-        else:
-            return_index = True
-        return self._decode_state(params, X, y, is_new_session, return_index)
-
-    def _compute_loss(
+    def compute_loss(
         self,
-        params: GLMHMMParams,
+        params: Tuple[DESIGN_INPUT_TYPE, jnp.ndarray],
         X: DESIGN_INPUT_TYPE,
         y: jnp.ndarray,
         *args,
         **kwargs,
     ) -> jnp.ndarray:
-        """Loss function (expected HMM log-likelihood) without validation."""
+        """Loss function."""
         pass
 
+    # INITIALIZATIONS
+    def initialize_params(
+        self,
+        X: DESIGN_INPUT_TYPE,
+        y: jnp.ndarray,
+        init_params: Optional[
+            Tuple[Tuple[ArrayLike, ArrayLike], ArrayLike, ArrayLike]
+        ] = None,
+    ) -> Union[Any, NamedTuple]:
+        """Initialize the solver's state and optionally sets initial model parameters for the optimization.
+
+        TODO: fill up docstrings.
+        """
+        return super().initialize_params(X, y, init_params)
+
+    def _initialize_parameters(
+        self,
+        X: DESIGN_INPUT_TYPE,
+        y: jnp.ndarray,
+    ) -> ModelParams:
+        """GLM-HMM initialization."""
+
+        key = self.seed
+        init_glm_params = self._initialize_glm_params
+        if callable(init_glm_params):
+            key, subkey = jax.random.split(key)
+            coef, intercept = init_glm_params(
+                1 if y.ndim == 1 else y.shape[1], self._n_states, X, subkey
+            )
+            if y.ndim == 1:
+                coef, intercept = jnp.squeeze(coef), jnp.squeeze(intercept)
+            init_glm_params = coef, intercept
+
+        init_transition_proba = self._initialize_transition_proba
+        if callable(init_transition_proba):
+            key, subkey = jax.random.split(key)
+            init_transition_proba = init_transition_proba(self._n_states, subkey)
+
+        init_proba = self._initialize_init_proba
+        if callable(init_proba):
+            key, subkey = jax.random.split(key)
+            init_proba = init_proba(self._n_states, subkey)
+
+        return init_glm_params, init_transition_proba, init_proba
+
+    def _get_m_step_loss_function(self, is_population_glm: bool):
+        """Prepare the loss function for the M-step of the GLM params."""
+        # prepare the loss function
+        likelihood_func, negative_log_likelihood_func = prepare_likelihood_func(
+            is_population_glm,
+            self.observation_model.log_likelihood,
+            self.observation_model._negative_log_likelihood,
+            is_log=True,
+        )
+        inverse_link_function = self.inverse_link_function
+
+        # closure for the static callable solver.run
+        # NOTE: this is the loss function used in the numerical M-step that learns coefficient and intercept.
+        def expected_negative_log_likelihood(
+            glm_params, design_matrix, observations, posterior_prob
+        ):
+            return hmm_negative_log_likelihood(
+                glm_params,
+                X=design_matrix,
+                y=observations,
+                posteriors=posterior_prob,
+                inverse_link_function=inverse_link_function,
+                negative_log_likelihood_func=negative_log_likelihood_func,
+            )
+
+        return likelihood_func, expected_negative_log_likelihood
+
+    def initialize_state(
+        self,
+        X: DESIGN_INPUT_TYPE,
+        y: jnp.ndarray,
+        init_params,
+        cast_to_jax_and_drop_nans: bool = True,
+    ) -> Union[Any, NamedTuple]:
+        """Initialize the state of the solver for running fit and update."""
+        X, y = self._preprocess_inputs(
+            X, y, cast_to_jax_and_drop_nans=cast_to_jax_and_drop_nans
+        )
+        if self._expected_negative_log_likelihood is None:
+            self._likelihood_func, self._expected_negative_log_likelihood = (
+                self._get_m_step_loss_function(y.ndim > 1)
+            )
+        self.instantiate_solver(self._expected_negative_log_likelihood)
+        opt_state = self.solver_init_state(init_params, X, y)
+        return opt_state
+
+    # CHECKS FOR PARAMS AND INPUTS
+    def _check_params(
+        self,
+        params: Tuple[Union[DESIGN_INPUT_TYPE, ArrayLike], ArrayLike],
+        data_type: Optional[jnp.dtype] = None,
+    ) -> Tuple[DESIGN_INPUT_TYPE, jnp.ndarray]:
+        """
+        Validate the dimensions and consistency of parameters.
+
+        This function checks the consistency of shapes and dimensions for model
+        parameters.
+        It ensures that the parameters and data are compatible for the model.
+
+        """
+        # check that params has length 4 (coeff, intercept, transition_proba, initial_proba)
+        validation.check_length(
+            params,
+            3,
+            "GLM-HMM requires three parameters: "
+            "``(glm_params, transition_proba, initial_proba)``.\n ``glm_params`` must be a "
+            "length 2 tuple ``(coef, intercept)``.",
+        )
+        validation.check_length(
+            params[0],
+            2,
+            "The GLM params must be a length two tuple, ``(coef, intercept)``.",
+        )
+        # convert to jax array (specify type if needed)
+        params = validation.convert_tree_leaves_to_jax_array(
+            params,
+            "Initial parameters must be array-like objects (or pytrees of array-like objects) "
+            "with numeric data-type!",
+            data_type,
+        )
+        self._check_initial_glm_params(params[0])
+        self._check_transition_proba(params[1])
+        self._check_init_state_proba(params[2])
+        return params
+
+    @staticmethod
+    def _check_input_dimensionality(
+        X: Optional[Union[DESIGN_INPUT_TYPE, jnp.ndarray]] = None,
+        y: Optional[jnp.ndarray] = None,
+    ):
+        GLM._check_input_dimensionality(X=X, y=y)
+
+    @staticmethod
+    def _check_input_and_params_consistency(
+        params: ModelParams,  # TODO: Add signature
+        X: Optional[Union[DESIGN_INPUT_TYPE, jnp.ndarray]] = None,
+        y: Optional[jnp.ndarray] = None,
+    ):
+        """Validate the number of features in model parameters and input arguments.
+
+        Raises
+        ------
+        ValueError
+            - if the number of features is inconsistent between params[1] and X
+              (when provided).
+
+        """
+        if X is not None:
+            # check that X and params[0] have the same structure
+            if isinstance(X, FeaturePytree):
+                data = X.data
+            else:
+                data = X
+            coef, intercept = params[0]
+            struct1 = jax.tree_util.tree_structure(data)
+            struct2 = jax.tree_util.tree_structure(coef)
+            if struct1 != struct2:
+                raise ValueError(
+                    f"X and the GLM coefficients must be PyTrees with the same structure.\n"
+                    f"X has structure {struct1} and coefficients have structure {struct2}. "
+                )
+
+            # check the consistency of the feature axis
+            validation.check_tree_axis_consistency(
+                coef,
+                data,
+                axis_1=0,
+                axis_2=1,
+                err_message="Inconsistent number of features. "
+                f"GLM coefficients have {jax.tree_util.tree_map(lambda p: p.shape[0], coef)} features, "
+                f"X has {jax.tree_util.tree_map(lambda x: x.shape[1], X)} features instead!",
+            )
+
+    # Save
     def save_params(
         self,
         filename: Union[str, Path],
@@ -1146,29 +824,34 @@ class GLMHMM(BaseRegressor[GLMHMMUserParams, GLMHMMParams]):
         """Save model params."""
         # initialize saving dictionary
         fit_attrs = self._get_fit_state()
+        # coef_ and intercept_ are redundant
+        fit_attrs.pop("coef_")
+        fit_attrs.pop("intercept_")
         fit_attrs.pop("solver_state_")
         string_attrs = ["inverse_link_function"]
-        self._save_params(filename, fit_attrs, string_attrs)
+        putative_func = [
+            "initialize_init_proba",
+            "initialize_transition_proba",
+            "initialize_glm_params",
+        ]
+        for var_name in putative_func:
+            var = getattr(self, var_name)
+            if callable(var):
+                string_attrs.append(var_name)
+        super().save_params(filename, fit_attrs, string_attrs)
 
     # SVRG specific optimization not available.
     def _get_optimal_solver_params_config(self):
         """No optimal parameters known for SVRG in HMMGLM."""
         return None, None, None
 
-    def _get_model_params(self) -> GLMHMMParams:
-        glm_params = GLMParams(self.coef_, self.intercept_)
-        scale = GLMScale(jnp.log(self.scale_))
-        hmm_params = HMMParams(
-            jnp.log(self.initial_prob_), jnp.log(self.transition_prob_)
-        )
-        return GLMHMMParams(glm_params, scale, hmm_params)
+    def _get_coef_and_intercept(self) -> Tuple[Any, Any]:
+        if self.glm_params_ is not None:
+            return self.glm_params_
+        return None, None
 
-    def _set_model_params(self, params: GLMHMMParams):
-        self.coef_ = params.glm_params.coef
-        self.intercept_ = params.glm_params.intercept
-        self.scale_ = jnp.exp(params.glm_scale.log_scale)
-        self.initial_prob_ = jnp.exp(params.hmm_params.log_initial_prob)
-        self.transition_prob_ = jnp.exp(params.hmm_params.log_transition_prob)
+    def _set_coef_and_intercept(self, params):
+        self.glm_params_ = params
 
     def update(
         self,
@@ -1177,42 +860,7 @@ class GLMHMM(BaseRegressor[GLMHMMUserParams, GLMHMMParams]):
         X: DESIGN_INPUT_TYPE,
         y: jnp.ndarray,
         *args,
-        n_samples: Optional[int] = None,
         **kwargs,
-    ) -> StepResult:
+    ) -> jaxopt.OptStep:
         """Run a single update step of the jaxopt solver."""
-        is_new_session = self._get_is_new_session(X, y)
-
-        # cast to jax and find non-nans
-        X, y, is_new_session = tree_utils.drop_nans(X, y, is_new_session)
-        X, y = cast_to_jax(lambda *x: x)(X, y)
-        is_new_session = is_new_session.at[0].set(True)
-
-        # grab the data
-        data = X.data if isinstance(X, FeaturePytree) else X
-
-        # wrap into GLM params, this assumes params are well-structured,
-        # if initialization is done via `initialize_solver_and_state` it
-        # should be fine
-        params = self._validator.to_model_params(params)
-
-        # perform a one-step update
-        updated_params, updated_state = self._optimization_update(
-            params, opt_state, data, y, *args, is_new_session=is_new_session, **kwargs
-        )
-
-        # store params and state
-        self._set_model_params(updated_params)
-        self.solver_state_ = updated_state
-
-        # estimate the scale
-        self.dof_resid_ = self._estimate_resid_degrees_of_freedom(
-            X, n_samples=n_samples
-        )
-        return self._validator.from_model_params(updated_params), updated_state
-
-    def __repr__(self) -> str:
-        """Hierarchical repr for the GLMHMM class."""
-        return format_repr(
-            self, multiline=True, use_name_keys=["inverse_link_function"]
-        )
+        pass

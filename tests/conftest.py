@@ -39,12 +39,16 @@ from nemos.basis import AdditiveBasis, CustomBasis, MultiplicativeBasis, Zero
 from nemos.basis._basis import Basis
 from nemos.basis._basis_mixin import BasisMixin
 from nemos.basis._transformer_basis import TransformerBasis
+<<<<<<< HEAD
 from nemos.glm.params import GLMParams
+=======
+>>>>>>> 2c8ee2cca7a9d76c8f0b505f48b94367aaeeec17
 from nemos.glm_hmm.initialize_parameters import (
     random_glm_params_init,
     sticky_transition_proba_init,
     uniform_initial_proba_init,
 )
+<<<<<<< HEAD
 from nemos.inverse_link_function_utils import log_softmax
 from nemos.pytrees import FeaturePytree
 from nemos.tree_utils import tree_full_like
@@ -85,6 +89,8 @@ def initialize_feature_mask_for_population_glm(X, n_neurons: int, coef=None):
     else:
         return jnp.ones((X.shape[1], n_neurons))
 
+=======
+>>>>>>> 2c8ee2cca7a9d76c8f0b505f48b94367aaeeec17
 
 DEFAULT_KWARGS = {
     "n_basis_funcs": 5,
@@ -1337,6 +1343,7 @@ def run_simulation_glm_hmm(
     design_matrix: jnp.ndarray, model: nmo.glm_hmm.GLMHMM, seed: int
 ):
     n_timepoints = design_matrix.shape[0]
+<<<<<<< HEAD
     coef, intercept = model.coef_, model.intercept_
     if coef.ndim > 2:
         n_neurons = coef.shape[1]
@@ -1345,6 +1352,19 @@ def run_simulation_glm_hmm(
     n_states = intercept.shape[-1]
     initial_prob = model.initial_prob_
     transition_prob = model.transition_prob_
+=======
+    if isinstance(model.initialize_glm_params, tuple):
+        coef, intercept = model.initialize_glm_params
+        if coef.ndim > 2:
+            n_neurons = coef.shape[1]
+        else:
+            n_neurons = 1
+        n_states = intercept.shape[-1]
+        initial_prob = model.initialize_init_proba
+        transition_prob = model.initialize_transition_proba
+    else:
+        raise ValueError("Must provided concrete intial values to run simulaitons.")
+>>>>>>> 2c8ee2cca7a9d76c8f0b505f48b94367aaeeec17
 
     # Initialize GLM
     glm = nmo.glm.PopulationGLM(
@@ -1359,17 +1379,25 @@ def run_simulation_glm_hmm(
 
     # Sample initial state
     np.random.seed(seed)
+<<<<<<< HEAD
     initial_state = np.random.choice(
         n_states,
         p=np.asarray(initial_prob, dtype=float)
         / sum(np.asarray(initial_prob, dtype=float)),
     )
+=======
+    initial_state = np.random.choice(n_states, p=initial_prob)
+>>>>>>> 2c8ee2cca7a9d76c8f0b505f48b94367aaeeec17
     latent_states[0, initial_state] = 1
 
     # Set initial weights and simulate first timepoint
     glm.coef_ = coef[..., initial_state].reshape(coef.shape[0], n_neurons)
     glm.intercept_ = intercept[..., initial_state].reshape((n_neurons,))
     glm.scale_ = 1.0
+<<<<<<< HEAD
+=======
+    glm._initialize_feature_mask(design_matrix, rates)
+>>>>>>> 2c8ee2cca7a9d76c8f0b505f48b94367aaeeec17
 
     key = jax.random.PRNGKey(seed)
     counts[0], rates[0] = glm.simulate(key, design_matrix[:1])
@@ -1407,13 +1435,30 @@ def instantiate_glm_hmm_func(
     solver_name: str = None,
     simulate=False,
 ):
+<<<<<<< HEAD
     np.random.seed(123)
+=======
+    jax.config.update("jax_enable_x64", True)
+    np.random.seed(123)
+    n_neurons = 1
+    n_features = 2
+    X = np.ones((500, n_features))
+    X[:250, 0] = 0
+    X[np.arange(500) % 2 == 1, 1] = 0
+    glm_params = random_glm_params_init(
+        n_neurons, n_states, X, random_key=jax.random.PRNGKey(123)
+    )
+    glm_params = jax.numpy.squeeze(glm_params[0]), np.squeeze(glm_params[1])
+    transition_prob = sticky_transition_proba_init(n_states)
+    init_prob = uniform_initial_proba_init(n_states, random_key=jax.random.PRNGKey(124))
+>>>>>>> 2c8ee2cca7a9d76c8f0b505f48b94367aaeeec17
 
     model = nmo.glm_hmm.GLMHMM(
         n_states=n_states,
         observation_model=obs_model,
         regularizer=regularizer,
         solver_name=solver_name,
+<<<<<<< HEAD
     )
     n_features = 2
 
@@ -1457,6 +1502,23 @@ def instantiate_glm_hmm_func(
         ),
         rates=rates,
         extra=latent_states,
+=======
+        initialize_transition_proba=transition_prob,
+        initialize_glm_params=glm_params,
+        initialize_init_proba=init_prob,
+    )
+    if simulate:
+        counts, rates, latent_states = run_simulation_glm_hmm(X, model, seed=1234)
+    else:
+        counts, rates, latent_states = None, None, None
+    return (
+        X,
+        counts,
+        model,
+        (glm_params, transition_prob, init_prob),
+        rates,
+        latent_states,
+>>>>>>> 2c8ee2cca7a9d76c8f0b505f48b94367aaeeec17
     )
 
 
@@ -1618,10 +1680,13 @@ MODEL_CONFIG = {
         "is_population": True,
         "default_y_shape": (500, 3),
     },
+<<<<<<< HEAD
     "ClassifierPopulationGLM": {
         "is_population": True,
         "default_y_shape": (500, 3),
     },
+=======
+>>>>>>> 2c8ee2cca7a9d76c8f0b505f48b94367aaeeec17
     "GLMHMM": {
         "is_population": False,
         "default_y_shape": (500,),
@@ -1662,10 +1727,13 @@ def instantiate_base_regressor_subclass(request):
             )
         elif model_name == "GLMHMM":
             result = instantiate_glm_hmm_func(obs_model=obs_model, simulate=simulate)
+<<<<<<< HEAD
         elif model_name == "ClassifierGLM":
             result = instantiate_classifier_glm_func(simulate=simulate)
         elif model_name == "ClassifierPopulationGLM":
             result = instantiate_population_classifier_glm_func(simulate=simulate)
+=======
+>>>>>>> 2c8ee2cca7a9d76c8f0b505f48b94367aaeeec17
         else:
             raise ValueError("model_name {} unknown".format(model_name))
         _MODEL_CACHE[cache_key] = result

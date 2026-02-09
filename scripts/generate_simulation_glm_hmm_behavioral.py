@@ -10,15 +10,11 @@ https://github.com/Brody-Lab/venditto_glm-hmm/blob/main/glmhmm_example_fit.m
 and on the behavioral variables considered in Ashwood et al. (2020).
 """
 
+# IMPORTS
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
-
-# %%
-###
-# IMPORTS
-###
 import nemos as nmo
 from nemos.glm_hmm.algorithm_configs import (
     prepare_estep_log_likelihood,
@@ -26,44 +22,36 @@ from nemos.glm_hmm.algorithm_configs import (
 )
 from nemos.glm_hmm.expectation_maximization import (
     em_glm_hmm,
-    forward_backward,
+    forward_pass,
+    hmm_negative_log_likelihood,
+    prepare_likelihood_func,
+    compute_rate_per_state
 )
-
-###
-# SESSION PARAMETERS
-###
-
-seed = 123  # Random seed for reproducibility
+seed = 0  # Random seed for reproducibility
 np.random.seed(seed)
+jax.config.update("jax_enable_x64", True)
 
-n_sess = 20  # Number of sessions to simulate
-n_trials_per_sess = 100  # Number of trials in a session
-n_timepoints = n_sess * n_trials_per_sess  # Total number of timepoints
-new_sess = np.zeros(n_timepoints, dtype=int)  # Indicator for session starts
-new_sess[::n_trials_per_sess] = 1  # Set 1 at the beginning of each session
+# SESSION PARAMETERS
+n_sess = 20                                     # Number of sessions to simulate
+n_trials_per_sess = 100                         # Number of trials in a session
+n_timepoints = n_sess * n_trials_per_sess       # Total number of timepoints
+new_sess = np.zeros(n_timepoints, dtype=int)    # Indicator for session starts
+new_sess[::n_trials_per_sess] = 1               # Set 1 at the beginning of each session
+# GLM-HMM parameters
+n_states = 3                                    # Number of latent states
 
-###
-# GLM-HMM PARAMETERS
-###
-n_states = 3  # Number of latent states
+# We will consider a design matrix with the following behavioral variables
+X_labels = ["bias", "stimulus"]
 
-# We will consider a design matrix with the
-# following behavioral variables
-# x = [bias, stimulus, last_choice, win_stay_lose_shift]
-X_labels = ["bias", "stimulus"]  # , "last_choice", "win-stay-lose-shift"]
-
-n_features = len(X_labels)  # Number of features in design matrix
+n_features = len(X_labels) - 1  # Number of features in design matrix
+                                # Substracting one because Nemos does not consider intercept as feature
 
 # Projection weights, using parameters from Ashwood et al. (2020)
-# results for example IBL mouse (Fig. 2)
-# NOTE: in the ssh tutorial, they only use Bias and Stimulus. Since computing previous choice and WSLS might take a bit, I will only use those two for now. It is pending to add the other two elements in the projection weights and design matrix.
 true_projection_weights = np.array(
-    [
-        [1, -3, 3],  # Bias - Intercept
-        [6, 2, 2],  # Stimulus
-        # [0, -.1, .1],          # Previous choice
-        # [0, 0, 0],             # Win stay Lose switch
-    ]
+    [6, 2, 2], dtype=float  # Stimulus
+)
+true_intercept = np.array(
+    [1, -3, 3],dtype=float  # Bias - Intercept
 )
 
 # Initial state probabilities
@@ -74,10 +62,7 @@ true_initial_prob = jnp.array([0.95, 0.025, 0.025])
 true_transition_prob = np.array(
     [[0.98, 0.01, 0.01], [0.05, 0.92, 0.03], [0.03, 0.03, 0.94]]
 )
-
-###
-# STIMULI
-###
+# Stimuli shown to the "mice"
 stim_vals = [
     -1,
     -0.5,
@@ -90,65 +75,55 @@ stim_vals = [
     0.25,
     0.5,
     1,
-]  # STimuli shown to the "mice"
+]
 
 # Generate random sequence of stimuli for simulation
-X = np.ones((n_timepoints, n_features))
-X[:, 1] = np.random.choice(stim_vals, n_timepoints)
+X = np.random.choice(stim_vals, n_timepoints)
+X = X.reshape(n_timepoints, n_features)
 
-###
-# SIMULATION
-###
-
+# Simulation
 # Initialize storage
-true_latent_states = np.zeros((n_timepoints, n_states), dtype=int)
+true_latent_states = np.zeros((n_timepoints, n_states), dtype=int)  # n_timepoints, n_states
 choice_probas = np.zeros((n_timepoints,))
 true_choices = np.zeros((n_timepoints,))
 
 # Simulate states and observations
-initial_state = np.random.choice(n_states, p=true_initial_prob)
-true_latent_states[0, initial_state] = 1
+initial_state = np.random.choice(n_states,
+                                 p=true_initial_prob)
+true_latent_states[0, initial_state] = 1                            # latent at timepoint 0
 
 # Initialize GLM
 glm = nmo.glm.GLM(observation_model="Bernoulli")
-glm.intercept_ = jnp.zeros((1,))
 
 # Set initial weights and simulate first timepoint
-glm.coef_ = true_projection_weights[..., initial_state].reshape(
-    true_projection_weights.shape[0], 1
-)
+glm.coef_ = true_projection_weights[initial_state].reshape(n_features,)
+glm.intercept_ = true_intercept[initial_state].reshape(1,)
 
 # Set key for replication
 key = jax.random.PRNGKey(seed)
+print(glm.coef_)
+print(X.shape)
 
 # Simulate first count and proba
 res_sim = glm.simulate(key, X[:1])
-
-true_choices[0] = res_sim[0][0].item()
-choice_probas[0] = res_sim[1][0].item()
+print(res_sim)
+true_choices[0] = res_sim[0][0]
+choice_probas[0] = res_sim[1][0]
 
 # Simulate remaining timepoints
 print("Simulating data...")
 for t in range(1, n_timepoints):
     # Sample next state
     key, subkey = jax.random.split(key)
-
     prev_state_vec = true_latent_states[t - 1]
-
-    # print(f"PREVIOUS STATE VECTOR {prev_state_vec} ")
-    # print(f"TRANSITION PROBAS {true_transition_prob}")
     transition_probs = true_transition_prob.T @ prev_state_vec
-    # print(f"TRANSITION PROBS {transition_probs}")
-
     next_state = jax.random.choice(subkey, jnp.arange(n_states), p=transition_probs)
-    # print(next_state)
-    # print(true_transition_prob)
-
     true_latent_states[t, next_state] = 1
-
+    
     # Update weights and simulate
-    glm.coef_ = true_projection_weights[..., next_state]
-    key, subkey = jax.random.split(key)
+    glm.coef_ = true_projection_weights[next_state].reshape(n_features,)
+    glm.intercept_ = true_intercept[next_state].reshape(1,)
+    key, subkey = jax.random.split(key) # Is this necessary again?
     res = glm.simulate(subkey, X[t : t + 1])
 
     true_choices[t] = res[0][0]
@@ -156,17 +131,13 @@ for t in range(1, n_timepoints):
     print(f"Simulated timepoint {t+1}/{n_timepoints}", end="\r")
 print("\nSimulation complete.")
 
-###
-# UTILS
-###
-
-
+# Utils
 def plot_glm_weights(
     n_features,
     n_states,
     true_projection_weights,
-    learned_coef,
     learned_intercept,
+    learned_coef,
     initialization_setting,
 ):
     ## Plot
@@ -176,6 +147,8 @@ def plot_glm_weights(
 
     recovered_weights[:1] = learned_intercept
     recovered_weights[1:] = learned_coef
+    
+    print(true_projection_weights[:,1])
 
     for k in range(n_states):
         if k == 0:
@@ -225,97 +198,6 @@ def plot_glm_weights(
     plt.show()
     return None
 
-
-def fit_glm_hmm_with_em(
-    X,
-    true_choices,
-    true_latent_states,
-    true_projection_weights,
-    initial_prob_initial_guess,
-    transition_prob_initial_guess,
-    projection_weights_initial_guess,
-    initialization_setting,
-):
-    is_population_glm = true_projection_weights.ndim > 2
-
-    observation_model = nmo.observation_models.BernoulliObservations()
-    likelihood_func = prepare_estep_log_likelihood(is_population_glm, observation_model)
-    inverse_link_function = observation_model.default_inverse_link_function
-    partial_hmm_negative_log_likelihood = prepare_mstep_nll_objective_param(
-        is_population_glm,
-        observation_model,
-        observation_model.default_inverse_link_function,
-    )
-
-    # use the BaseRegressor initialize_solver
-    regularization = "UnRegularized"
-
-    solver_name = "ProximalGradient" if "Lasso" in regularization else "LBFGS"
-    glm = nmo.glm.GLM(
-        observation_model=observation_model,
-        regularizer=regularization,
-        solver_name=solver_name,
-    )
-    glm._instantiate_solver(partial_hmm_negative_log_likelihood)
-    solver_run = glm._solver_run
-
-    (
-        posteriors,
-        joint_posterior,
-        learned_initial_prob,
-        learned_transition,
-        (learned_coef, learned_intercept),
-        final_state,
-    ) = em_glm_hmm(
-        X[:, 1:],
-        jnp.squeeze(true_choices),
-        initial_prob=initial_prob_initial_guess,
-        transition_prob=transition_prob_initial_guess,
-        glm_params=(
-            projection_weights_initial_guess[1:],
-            projection_weights_initial_guess[:1],
-        ),
-        inverse_link_function=inverse_link_function,
-        likelihood_func=likelihood_func,
-        m_step_fn_glm_params=solver_run,
-        tol=10**-10,
-    )
-    (
-        _,
-        _,
-        _,
-        log_likelihood_em,
-        _,
-        _,
-    ) = forward_backward(
-        X[:, 1:],  # drop intercept
-        true_choices,
-        learned_initial_prob,
-        learned_transition,
-        (learned_coef, learned_intercept),
-        log_likelihood_func=likelihood_func,
-        inverse_link_function=observation_model.default_inverse_link_function,
-    )
-
-    # find state mapping
-    corr_matrix = np.corrcoef(true_latent_states.T, posteriors.T)[
-        : true_latent_states.shape[1], true_latent_states.shape[1] :
-    ]
-    max_corr = np.max(corr_matrix, axis=1)
-    print("\nMAX CORR", max_corr)  # State recovery is quite low let's check why
-
-    plot_glm_weights(
-        n_features,
-        n_states,
-        true_projection_weights,
-        learned_coef,
-        learned_intercept,
-        initialization_setting,
-    )
-
-    return log_likelihood_em
-
-
 # Store likelihoods
 log_likelihoods = {}
 
@@ -335,7 +217,12 @@ print("--Check it sums to 1", initial_prob_initial_guess.sum())
 projection_weights_initial_guess = (
     true_projection_weights + np.random.randn(*true_projection_weights.shape) * 1e-8
 )
+
+intercept_initial_guess = (
+    true_intercept + np.random.randn(*true_intercept.shape) * 1e-8
+)
 print("Initial projection weights guess: \n", projection_weights_initial_guess)
+print(projection_weights_initial_guess.shape)
 
 # High proba in diagonal - low elsewhere
 transition_prob_initial_guess = np.ones(true_transition_prob.shape) * 0.05
@@ -343,16 +230,90 @@ transition_prob_initial_guess[np.diag_indices(true_transition_prob.shape[1])] = 
 print("Initial transition probability guess \n", transition_prob_initial_guess)
 print("--Check it sums to 1", transition_prob_initial_guess.sum(axis=1))
 
+# FIRST FIT : SAME AS TRUE
+# SETUP NEMOS
+# Observation model
+obs = nmo.observation_models.BernoulliObservations()
+inverse_link_function = obs.default_inverse_link_function
+# Likelihood function & wrapper
+log_likelihood_func, negative_log_likelihood_func = prepare_likelihood_func(
+    False, obs.log_likelihood, obs._negative_log_likelihood
+)
+def partial_hmm_negative_log_likelihood(
+        weights, design_matrix, observations, posterior_prob
+):
+    return hmm_negative_log_likelihood(
+        weights,
+        X=design_matrix,
+        y=observations,
+        posteriors=posterior_prob,
+        inverse_link_function=obs.default_inverse_link_function,
+        negative_log_likelihood_func=negative_log_likelihood_func,
+    )
+# glm object
+glm = nmo.glm.GLM(observation_model=obs, solver_name="LBFGS", solver_kwargs={"tol":1e-12, "maxiter": 5000})
+glm.instantiate_solver(partial_hmm_negative_log_likelihood)
 
-log_likelihoods[initialization_setting] = fit_glm_hmm_with_em(
-    X,
-    true_choices,
-    true_latent_states,
-    true_projection_weights,
-    initial_prob_initial_guess,
-    transition_prob_initial_guess,
-    projection_weights_initial_guess,
-    initialization_setting,
+# reshape params
+true_projection_weights = true_projection_weights.reshape(n_features, n_states)
+true_intercept = true_intercept.reshape(n_states)
+
+# fit
+(
+        posteriors,
+        joint_posterior,
+        log_initial_prob,
+        log_transition_matrix,
+        nemos_glm_params,
+        state,
+    ) = em_glm_hmm(
+            X,
+            (true_choices).astype(float),
+            initial_prob=initial_prob_initial_guess,
+            transition_prob=transition_prob_initial_guess,
+            glm_params=(projection_weights_initial_guess.reshape(n_features, n_states),
+                        intercept_initial_guess.reshape(n_states)),
+            inverse_link_function=obs.default_inverse_link_function,
+            likelihood_func=log_likelihood_func,
+            m_step_fn_glm_params=glm._solver_run,
+            is_new_session=new_sess,
+            maxiter=5000,
+            tol=1e-12,
+        )
+
+print(nemos_glm_params)
+
+nemos_initial_prob = log_initial_prob
+nemos_transition_prob = log_transition_matrix
+predicted_rate_given_state = compute_rate_per_state(
+    X, nemos_glm_params, inverse_link_function
+)
+
+log_like_nemos_stack = log_likelihood_func(1 - true_choices, predicted_rate_given_state)
+log_alphas, log_normalization = forward_pass(
+    log_initial_prob,
+    log_transition_matrix,
+    log_like_nemos_stack,
+    new_sess
+)
+# Stack array for plotting
+stacked_arr = np.stack([true_intercept, true_projection_weights.reshape(n_states)])
+
+plot_glm_weights(
+        n_features+1,
+        n_states,
+        stacked_arr,
+        nemos_glm_params[1],
+        nemos_glm_params[0],
+        initialization_setting,
+    )
+
+# Likelihood
+_,log_normalization = forward_pass(
+    log_initial_prob,
+    log_transition_matrix,
+    log_like_nemos_stack,
+    new_sess
 )
 print("\n Fitting complete.")
 ###
@@ -378,16 +339,7 @@ transition_prob_initial_guess = np.random.dirichlet(np.ones(n_states), size=3)
 print("Initial transition probability guess \n", transition_prob_initial_guess)
 print("--Check it sums to 1", transition_prob_initial_guess.sum(axis=1))
 
-log_likelihoods[initialization_setting] = fit_glm_hmm_with_em(
-    X,
-    true_choices,
-    true_latent_states,
-    true_projection_weights,
-    initial_prob_initial_guess,
-    transition_prob_initial_guess,
-    projection_weights_initial_guess,
-    initialization_setting,
-)
+
 print("\n Fitting complete.")
 
 
